@@ -12,7 +12,9 @@ xray_stop()     { systemctl stop xray; }
 xray_restart()  { systemctl restart xray; }
 xray_status()   { systemctl is-active xray &>/dev/null && echo active || echo inactive; }
 
-# Validate current config before restart. Returns 0 when valid.
+# Validasi config sebelum restart. Return 0 hanya bila benar-benar valid.
+# (Xray keluar dengan kode 23 saat config invalid, jadi service TIDAK akan
+# di-restart otomatis oleh systemd - lebih baik kita batalkan restart.)
 xray_validate() {
     [[ -f "$XRAY_CONFIG" ]] || { print_error "config.json tidak ada"; return 1; }
     if ! python3 -c "import json;json.load(open('$XRAY_CONFIG'))" 2>/dev/null; then
@@ -20,23 +22,26 @@ xray_validate() {
         return 1
     fi
     if command -v xray &>/dev/null; then
-        if ! xray run -test -c "$XRAY_CONFIG" &>/dev/null; then
-            print_warning "xray -test menandai config bermasalah (lanjut dengan hati-hati)"
+        if ! xray run -test -c "$XRAY_CONFIG" >/dev/null 2>&1; then
+            print_error "xray -test menandai config bermasalah"
+            return 1
         fi
     fi
     return 0
 }
 
 xray_safe_restart() {
-    if xray_validate; then
-        xray_restart
-        sleep 1
-        if [[ "$(xray_status)" == "active" ]]; then
-            print_success "Xray restarted"
-            return 0
-        fi
-        print_error "Xray gagal start - cek 'journalctl -u xray'"
+    if ! xray_validate; then
+        print_error "Xray TIDAK di-restart karena config tidak valid"
+        return 1
     fi
+    xray_restart
+    sleep 1
+    if [[ "$(xray_status)" == "active" ]]; then
+        print_success "Xray restarted"
+        return 0
+    fi
+    print_error "Xray gagal start - cek 'journalctl -u xray'"
     return 1
 }
 
@@ -46,6 +51,12 @@ xray_safe_restart() {
 xray_render_config() {
     # pull latest settings (domain, cert dir, ports)
     load_config
+    # simpan config lama: dipakai untuk rollback bila hasil render tidak valid
+    local prev_config=""
+    if [[ -f "$XRAY_CONFIG" ]]; then
+        prev_config=$(mktemp)
+        cp "$XRAY_CONFIG" "$prev_config"
+    fi
     apply_config_defaults
     local domain
     domain=$(get_domain)
@@ -98,7 +109,9 @@ EOF
 
     # Cert may be absent: Trojan requires TLS, so without cert we skip its
     # inbound instead of emitting invalid JSON ("tlsSettings": ,).
-    if [[ -z "$cert" ]]; then
+    # hanya tampilkan saat interaktif: fungsi ini juga jalan dari cron tiap
+    # menit dan peringatan berulang cuma membuat spam log
+    if [[ -z "$cert" && -t 1 ]]; then
         print_warning "Cert SSL tidak ada - inbound Trojan dilewati (butuh TLS)"
     fi
     local trojan_ws_json=""
@@ -180,45 +193,66 @@ EOF
     inject_clients "vless-ws-in"  "[${vless_clients}]"
     [[ -n "$trojan_clients_obj" ]] || trojan_clients_obj=''
     inject_clients "trojan-ws-in" "[${trojan_clients_obj}]"
+
+    # Validasi hasil render; kalau rusak, kembalikan config sebelumnya supaya
+    # service yang sedang jalan tidak ikut mati.
+    if ! xray_validate; then
+        if [[ -n "$prev_config" ]]; then
+            cp "$prev_config" "$XRAY_CONFIG"
+            print_warning "Config Xray baru tidak valid - dikembalikan ke config sebelumnya"
+        fi
+        [[ -n "$prev_config" ]] && rm -f "$prev_config"
+        return 1
+    fi
+    [[ -n "$prev_config" ]] && rm -f "$prev_config"
     return 0
 }
 
 # ---------- gRPC stats query ----------
-xray_stats_query() {  # xray_stats_query "<pattern>" -> prints "name###value### N" lines
-    local pattern="$1" payload resp
-    payload=$(python3 "${LIB_DIR}/xray_proto.py" encode "$pattern" | base64 -w0)
-    resp=$(printf '%s' "$payload" | base64 -d \
-        | timeout 5 nc 127.0.0.1 "$XRAY_API_PORT" 2>/dev/null | base64 -w0)
-    [[ -z "$resp" ]] && return 0
-    python3 "${LIB_DIR}/xray_proto.py" decode "$resp"
+# Memakai python (lib/xray_proto.py query) supaya tidak butuh binary `nc`
+# yang tidak terpasang bawaan di Debian/Ubuntu minimal.
+xray_stats_query() {  # xray_stats_query "<pattern>" -> "name<TAB>value" per baris
+    local pattern="$1"
+    command -v python3 &>/dev/null || return 0
+    python3 "${LIB_DIR}/xray_proto.py" query "$XRAY_API_PORT" "$pattern" 2>/dev/null
 }
 
 # ---------- Traffic per user (cached snapshot) ----------
+# Nama statistik Xray: user>>><uuid>@<tag>>>>traffic>>>{uplink,downlink}
+# Query memakai reset=true, jadi nilai yang dikembalikan = selisih sejak
+# pengambilan terakhir - aman untuk diakumulasi.
 xray_traffic_update() {  # fetch stats and merge into traffic db (uuid|total_bytes)
     local out
     out=$(xray_stats_query "")
     [[ -z "$out" ]] && return 0
-    local line name value key
-    while IFS= read -r line; do
-        [[ -z "$line" ]] && continue
-        name=$(echo "$line" | awk -F'###' '{print $1}')
-        value=$(echo "$line" | awk -F'###' '{print $3}' | tr -d ' ')
+    local name value key old total tmp
+    while IFS=$'\t' read -r name value; do
+        [[ -z "$name" || -z "$value" ]] && continue
         [[ "$name" != user* ]] && continue
-        key=$(echo "$name" | awk -F'@' '{print $1}')
+        key="${name#user>>>}"      # buang prefix "user>>>"
+        key="${key%%@*}"           # ambil uuid sebelum '@'
         [[ -z "$key" ]] && continue
-        local old=0
-        [[ -f "$XRAY_TRAFFIC_DB" ]] && old=$(grep "^${key}|" "$XRAY_TRAFFIC_DB" 2>/dev/null | awk -F'|' '{print $2}')
-        old=${old:-0}
-        local total=$(( old + value ))
-        sed -i "\|^${key}|d" "$XRAY_TRAFFIC_DB" 2>/dev/null
-        echo "${key}|${total}" >> "$XRAY_TRAFFIC_DB"
+        [[ "$value" =~ ^[0-9]+$ ]] || continue
+        old=0
+        if [[ -f "$XRAY_TRAFFIC_DB" ]]; then
+            old=$(awk -F'|' -v k="$key" '$1==k {print $2}' "$XRAY_TRAFFIC_DB" | head -n1)
+        fi
+        [[ "$old" =~ ^[0-9]+$ ]] || old=0
+        total=$(( old + value ))
+        tmp=$(mktemp)
+        if [[ -f "$XRAY_TRAFFIC_DB" ]]; then
+            awk -F'|' -v k="$key" '$1!=k' "$XRAY_TRAFFIC_DB" > "$tmp"
+        fi
+        echo "${key}|${total}" >> "$tmp"
+        mv "$tmp" "$XRAY_TRAFFIC_DB"
+        chmod 600 "$XRAY_TRAFFIC_DB" 2>/dev/null
     done <<< "$out"
 }
 
-xray_user_traffic() {  # xray_user_traffic <email/uuid> -> bytes total
+xray_user_traffic() {  # xray_user_traffic <uuid> -> bytes total
     local key="$1"
     [[ -f "$XRAY_TRAFFIC_DB" ]] || { echo 0; return; }
-    grep "^${key}|" "$XRAY_TRAFFIC_DB" 2>/dev/null | awk -F'|' '{print $2}' | head -n1
+    awk -F'|' -v k="$key" '$1==k {print $2; exit}' "$XRAY_TRAFFIC_DB" 2>/dev/null | head -n1
 }
 
 # ---------- Service status display ----------

@@ -156,13 +156,18 @@ class RawClient:
             pass
 
 
-def start_bridge(port, path, target_port, tls=False, cert=None, key=None):
-    """path=None -> mode standar '/' (tanpa path khusus)."""
+def start_bridge(port, path, target_port, tls=False, cert=None, key=None, max_per_ip=0):
+    """path=None -> mode standar '/' (tanpa path khusus).
+
+    max_per_ip=0 -> tanpa batas per-IP (dipakai mayoritas test agar saling
+    tidak mengganggu karena semuanya datang dari 127.0.0.1).
+    """
     cmd = [
         sys.executable, BRIDGE,
         "--listen", "127.0.0.1",
         "--port", str(port),
         "--target", "127.0.0.1:%d" % target_port,
+        "--max-per-ip", str(max_per_ip),
     ]
     if path is not None:
         cmd += ["--path", path]
@@ -197,6 +202,9 @@ def main():
     # bridge mode ketat: --path test (pencocokan path ditegakkan)
     strict_port = free_port()
     bridge_strict = start_bridge(strict_port, "test", echo_port)
+    # bridge dengan batas per-IP kecil untuk menguji proteksi abuse
+    limited_port = free_port()
+    bridge_limited = start_bridge(limited_port, None, echo_port, max_per_ip=2)
 
     try:
         # 1. handshake upgrade di path standar '/'
@@ -300,10 +308,41 @@ def main():
         check("service tetap hidup setelah klien putus",
               c10.recv_exact(11) == b"still-alive")
         c10.close()
+
+        # 12. batas koneksi per-IP (max-per-ip=2): koneksi ke-3 ditolak
+        ok1 = RawClient(limited_port)
+        ok1.handshake(path="/")
+        ok1.send(b"one")
+        ok2 = RawClient(limited_port)
+        ok2.handshake(path="/")
+        ok2.send(b"two")
+        check("per-IP: 2 koneksi pertama diterima",
+              ok1.recv_exact(3) == b"one" and ok2.recv_exact(3) == b"two")
+        blocked = False
+        try:
+            over = RawClient(limited_port, timeout=3.0)
+            over.handshake(path="/")
+            blocked = over.status != 101
+            over.close()
+        except (ConnectionError, OSError):
+            blocked = True
+        check("per-IP: koneksi ke-3 ditolak", blocked)
+        ok1.close(); ok2.close()
+        time.sleep(0.5)
+        # setelah slot bebas, koneksi baru diterima lagi
+        again = RawClient(limited_port, timeout=3.0)
+        try:
+            again.handshake(path="/")
+            again.send(b"again")
+            check("per-IP: slot bebas dipakai lagi", again.recv_exact(5) == b"again")
+        except (ConnectionError, OSError):
+            check("per-IP: slot bebas dipakai lagi", False, "koneksi ditolak")
+        again.close()
     finally:
         bridge.terminate()
         bridge_tls.terminate()
         bridge_strict.terminate()
+        bridge_limited.terminate()
         echo_stop.set()
         echo_srv.close()
 

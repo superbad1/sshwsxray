@@ -144,6 +144,7 @@ menu_settings() {
         echo -e "  Path SSH-WS      : / (standar, tanpa path)"
         echo -e "  Path Xray WS     : /${WS_PATH}"
         echo -e "  Transport Xray   : WebSocket (ws) saja"
+        echo -e "  Batas WS per-IP  : ${WS_MAX_PER_IP:-16}"
         echo -e "  Batas IP default : ${IP_LIMIT}"
         echo -e "  Trial (jam)      : ${TRIAL_HOURS}"
         echo -e "  Auto reboot      : ${AUTO_REBOOT} (1=aktif 05:00)"
@@ -216,6 +217,7 @@ menu_settings() {
 # ============================================================
 # Main menu
 # ============================================================
+main_menu() {
 while true; do
     print_header
     echo ""
@@ -237,7 +239,14 @@ while true; do
         4) menu_backup ;;
         5) menu_settings ;;
         6) sysinfo ;;
-        x|X) clear; exit 0 ;;
+        x|X) clear; return 0 ;;
         *) print_warning "Pilihan tidak valid"; sleep 1 ;;
     esac
 done
+}
+
+# Hanya jalankan menu bila dieksekusi langsung (saat di-source oleh test,
+# cukup definisi fungsinya saja).
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main_menu
+fi

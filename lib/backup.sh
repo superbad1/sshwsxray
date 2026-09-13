@@ -1,25 +1,30 @@
 #!/bin/bash
 # ============================================================
 #  lib/backup.sh - Backup & restore lokal (dengan rotasi)
+#
+#  Arsip TIDAK memuat /etc/shadow (hash password). Pembuatan arsip memakai
+#  _tg_archive_create() dari lib/telegram.sh supaya isinya konsisten dengan
+#  backup yang dikirim ke Telegram.
 # ============================================================
 
 BACKUP_DIR="/root/backup"
 KEEP_LAST=5
 
 _make_archive() {  # -> prints archive path
-    local hostname ip stamp file
+    local hostname stamp file
     mkdir -p "$BACKUP_DIR"
+    chmod 700 "$BACKUP_DIR" 2>/dev/null
     hostname=$(hostname)
-    ip=$(pubip)
     stamp=$(date +%Y%m%d-%H%M%S)
     file="${BACKUP_DIR}/backup-${hostname}-${stamp}.tar.gz"
-    tar -czf "$file" \
-        /etc/sshwsxray \
-        /etc/shadow /etc/passwd /etc/group \
-        /etc/letsencrypt 2>/dev/null
-    if [[ -f "$XRAY_CONFIG" ]]; then
-        tar -rzf "$file" -C / usr/local/etc/xray/config.json 2>/dev/null
+    if declare -F _tg_archive_create >/dev/null 2>&1; then
+        _tg_archive_create "$file"
+    else
+        tar -czf "$file" /etc/sshwsxray 2>/dev/null
+        [[ -f "$XRAY_CONFIG" ]] && tar -rzf "$file" -C / usr/local/etc/xray/config.json 2>/dev/null
+        chmod 600 "$file" 2>/dev/null
     fi
+    [[ -s "$file" ]] || return 1
     echo "$file"
 }
 
@@ -68,13 +73,16 @@ backup_restore_menu() {
     ls -1t "${BACKUP_DIR}"/backup-*.tar.gz | nl -w2 -s') '
     echo ""
     read -rp "Nomor backup yang di-restore [0=batal]: " num
+    if ! is_int "$num" || [[ "$num" == "0" ]]; then
+        print_info "Dibatalkan"; pause_menu; return 0
+    fi
     local file
     file=$(ls -1t "${BACKUP_DIR}"/backup-*.tar.gz | sed -n "${num}p")
     if [[ -z "$file" ]]; then
-        print_info "Dibatalkan"; pause_menu; return 0
+        print_error "Nomor tidak ada dalam daftar"
+        pause_menu; return 1
     fi
-    confirm "Restore dari $(basename "$file")? User & konfigurasi akan ditimpa."
-    if [[ $? -eq 0 ]]; then
+    if confirm "Restore dari $(basename "$file")? Data akun saat ini akan ditimpa (snapshot otomatis dibuat)."; then
         tg_restore "$file"
     fi
     pause_menu

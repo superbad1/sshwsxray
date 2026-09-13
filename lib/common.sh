@@ -65,14 +65,27 @@ detect_os() {
 
 # ---------- Config load/save ----------
 # Config format: KEY="value" (one per line)
+#
+# Nilai di-escape sebelum ditulis karena file ini di-source oleh script lain:
+#   * backslash & kutip ganda -> supaya isi file tetap valid sebagai string shell
+#   * & dan #                 -> supaya tidak merusak penggantian sed
+# Newline dibuang agar tetap satu baris per key.
 save_config() {  # save_config KEY VALUE
     local key="$1" value="$2"
-    if [[ -f "$CONFIG_FILE" ]] && grep -qE "^${key}=" "$CONFIG_FILE" 2>/dev/null; then
-        sed -i "s|^${key}=.*|${key}=\"${value}\"|" "$CONFIG_FILE"
-    else
-        echo "${key}=\"${value}\"" >> "$CONFIG_FILE"
+    value="${value//$'\n'/ }"
+    # hanya backslash & kutip ganda yang perlu di-escape agar file tetap
+    # valid sebagai shell; penggantian baris dilakukan dengan awk (bukan sed)
+    # supaya karakter & # | " tidak merusak hasilnya.
+    local esc tmp
+    esc=$(printf '%s' "$value" | sed -e 's/[\\"]/\\&/g')
+    mkdir -p "$(dirname "$CONFIG_FILE")" 2>/dev/null
+    tmp=$(mktemp)
+    if [[ -f "$CONFIG_FILE" ]]; then
+        awk -F= -v k="$key" '$1 != k' "$CONFIG_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
     fi
-    chmod 600 "$CONFIG_FILE"
+    printf '%s="%s"\n' "$key" "$esc" >> "$tmp" || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$CONFIG_FILE" || return 1
+    chmod 600 "$CONFIG_FILE" 2>/dev/null
     # keep current shell in sync so callers see the new value immediately
     printf -v "$key" '%s' "$value"
 }
@@ -94,6 +107,8 @@ apply_config_defaults() {
     WS_PATH="${WS_PATH:-wsxray}"
     WS_PORT="${WS_PORT:-80}"
     WSS_PORT="${WSS_PORT:-443}"
+    # batas koneksi bersamaan per-IP untuk bridge SSH-WebSocket
+    WS_MAX_PER_IP="${WS_MAX_PER_IP:-16}"
     # Hanya transport WebSocket yang dipakai (gRPC & Reality dihapus)
     XRAY_VMESS_WS_PORT="${XRAY_VMESS_WS_PORT:-10086}"
     XRAY_VLESS_WS_PORT="${XRAY_VLESS_WS_PORT:-10088}"
@@ -103,6 +118,12 @@ apply_config_defaults() {
     TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
     IP_LIMIT="${IP_LIMIT:-2}"
     TRIAL_HOURS="${TRIAL_HOURS:-1}"
+    # nilai dari config bisa saja diedit manual -> paksa numerik
+    is_int "$IP_LIMIT" || IP_LIMIT=2
+    is_int "$TRIAL_HOURS" || TRIAL_HOURS=1
+    is_int "$WS_PORT" || WS_PORT=80
+    is_int "$WSS_PORT" || WSS_PORT=443
+    is_int "$WS_MAX_PER_IP" || WS_MAX_PER_IP=16
     AUTO_REBOOT="${AUTO_REBOOT:-0}"
     BACKUP_ENABLED="${BACKUP_ENABLED:-1}"
 }
@@ -152,21 +173,33 @@ add_days() { date -d "+$1 days" +%Y-%m-%d; }
 add_hours() { date -d "+$1 hours" +"%Y-%m-%d %H:%M"; }
 
 # Print epoch seconds for a "YYYY-MM-DD" or "YYYY-MM-DD HH:MM" value
-date_to_epoch() { date -d "$1" +%s; }
+date_to_epoch() { date -d "$1" +%s 2>/dev/null; }
 
-# Return 0 if given date/time is in the past (expired)
+# Return 0 if given date/time is in the past (expired).
+# Tanggal kosong/tidak bisa diparse dianggap BELUM expired: lebih aman
+# daripada menghapus akun hanya karena field-nya rusak.
 is_expired() {
     local target
-    target=$(date_to_epoch "$1")
+    # kosong juga harus dianggap "belum expired": GNU date mengubah string
+    # kosong menjadi tengah malam hari ini, yang akan terbaca sebagai expired
+    # dan membuat akun terhapus sendiri.
+    [[ -z "${1// /}" ]] && return 1
+    target=$(date_to_epoch "$1") || true
+    [[ -z "$target" ]] && return 1
     (( target < $(date +%s) ))
 }
 
 # Days remaining until given date (negative = overdue)
 days_left() {
     local target
-    target=$(date_to_epoch "$1")
+    [[ -z "${1// /}" ]] && { echo 0; return 0; }
+    target=$(date_to_epoch "$1") || true
+    if [[ -z "$target" ]]; then echo 0; return 0; fi
     echo $(( (target - $(date +%s)) / 86400 ))
 }
+
+# True bila argumen berupa bilangan bulat non-negatif
+is_int() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
 
 # ---------- Random generators ----------
 gen_uuid() {
@@ -200,10 +233,18 @@ db_add() {  # db_add <dbfile> <line>
     chmod 600 "$1"
 }
 
-# Remove lines where ANY colon-free field equals name (field separator: |)
-db_del() {  # db_del <dbfile> <name>
-    # \#...# = custom sed delimiter (leading backslash is required!)
-    sed -i "\\#^\\([^|]*|\\)*${2}|#d" "$1" 2>/dev/null
+# Buat file database bila belum ada. TIDAK PERNAH menimpa/mengosongkan file
+# yang sudah berisi data (installer dulu memakai ': > file' yang menghapus
+# seluruh akun setiap kali dijalankan).
+ensure_db_files() {
+    mkdir -p "$INSTALL_DIR"
+    chmod 700 "$INSTALL_DIR" 2>/dev/null
+    local f
+    for f in ssh_users.db xray_users.db xray_traffic.db trial_users.db; do
+        [[ -f "$INSTALL_DIR/$f" ]] || : > "$INSTALL_DIR/$f"
+        chmod 600 "$INSTALL_DIR/$f" 2>/dev/null
+    done
+    return 0
 }
 
 # ---------- Misc ----------

@@ -10,10 +10,11 @@ Autoscript instalasi dan manajemen user untuk tunnel **SSH over WebSocket** dan 
 - Masa aktif otomatis (expired date), akun trial per-jam, renew menjumlah dari sisa masa aktif
 
 **Keamanan & monitoring**
-- Limit IP per akun SSH (via `netsense` + pemutusan sesi oleh cron)
-- Deteksi multi-login (alert Telegram saat sesi ganda terdeteksi)
-- Auto-hapus akun Xray yang expired + lock akun SSH expired
-- Traffic per akun Xray via StatsService API Xray
+- Limit IP per akun SSH — dihitung sendiri dari koneksi sshd yang aktif (`ss` + `ps`, tanpa script pihak ketiga), pemutusan oleh cron
+- Deteksi multi-login (alert Telegram saat sesi ganda terdeteksi, dengan cooldown 30 menit supaya tidak spam)
+- Auto-hapus akun Xray yang expired + lock akun SSH expired (dan otomatis dibuka lagi saat di-renew)
+- Traffic per akun Xray via StatsService API Xray (query via python, tanpa binary `nc`)
+- ⚠️ Limit IP hanya berlaku untuk akun **SSH**; protokol Xray tidak punya penegakan limit IP per akun
 - Info sistem: CPU, RAM, disk, uptime, status semua service
 - Speedtest server
 
@@ -126,6 +127,13 @@ sudo sshwsxray
 
 Semua port dapat diubah di `/etc/sshwsxray/config` lalu restart service.
 
+Kalau `ufw` terpasang & aktif, installer membuka port-port di atas otomatis.
+Kalau tidak, pastikan port tersebut terbuka di firewall/security group VPS
+(pesan peringatan akan ditampilkan di akhir instalasi).
+
+`WS_MAX_PER_IP` (default `16`) membatasi jumlah koneksi SSH-WebSocket
+bersamaan dari satu alamat IP; isi `0` untuk mematikannya.
+
 ## File Penting
 
 | Path | Fungsi |
@@ -151,9 +159,15 @@ Coba test dengan **menu 5 → 7**.
 ## Catatan Keamanan
 
 - `PermitRootLogin yes` dipakai secara default ala autoscript klasik — disarankan ganti ke `prohibit-password` dan pakai key SSH.
-- Semua `.db` dan key disimpan dengan permission `600`, direktori data `700`.
-- Limit IP via cron punya jeda sampai 60 detik; untuk enforcement real-time, integrasikan `netsense` langsung di PAM.
-- Backup berisi `/etc/shadow` — jaga file backup & chat Telegram bot kamu.
+  `sshd_config` hasil installer divalidasi dengan `sshd -t` sebelum dipakai; kalau tidak valid, config lama otomatis dikembalikan.
+- Semua `.db`, config, dan key disimpan dengan permission `600`, direktori data `700`.
+- **Password SSH tidak disimpan di database** (field password diisi `-`). Satu-satunya tempat password ada adalah file info akun `/root/<user>-ssh-ws.txt` (mode `600`).
+- Arsip backup **tidak memuat `/etc/shadow`**. Restore hanya mengekstrak data aplikasi (`/etc/sshwsxray` + config Xray) dan tidak pernah menimpa `/etc/passwd`, `/etc/shadow`, `/etc/group`.
+- Restore membuat snapshot otomatis (`/root/backup/pre-restore-*.tar.gz`) sebelum menimpa data. User yang dibuat ulang mendapat password acak baru yang ditampilkan sekali.
+- Config Xray divalidasi (`xray run -test`) sebelum restart; kalau tidak valid, config lama otomatis dipulihkan sehingga service tidak ikut mati.
+- Limit IP via cron punya jeda sampai 60 detik karena cron berjalan tiap menit.
+- Installer tidak lagi mengunduh script pihak ketiga — hanya paket apt resmi + installer resmi Xray.
+- Arsip backup memuat `/etc/sshwsxray/config` (termasuk token bot Telegram). Simpan arsip & chat bot dengan aman.
 
 ## Uninstall
 

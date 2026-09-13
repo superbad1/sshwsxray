@@ -42,10 +42,12 @@ expire_check_menu() {
     if confirm "Kirim ringkasan ke Telegram?"; then
         local msg="📅 <b>LAPORAN MASA AKTIF</b>"
         while IFS='|' read -r user _pass _created expired _iplimit; do
-            msg+="%0ASSH ${user}: $(days_left "$expired") hari"
+            [[ -z "$user" ]] && continue
+            msg+="%0ASSH $(tg_escape "$user"): $(days_left "$expired") hari"
         done < "$SSH_DB" 2>/dev/null
         while IFS='|' read -r proto uuid user _created expired _iplimit; do
-            msg+="%0A${proto} ${user}: $(days_left "$expired") hari"
+            [[ -z "$proto" ]] && continue
+            msg+="%0A${proto} $(tg_escape "$user"): $(days_left "$expired") hari"
         done < "$XRAY_DB" 2>/dev/null
         tg_send "$msg"
         print_success "Ringkasan terkirim"

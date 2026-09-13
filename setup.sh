@@ -17,7 +17,7 @@ INSTALL_DIR="${SSHWSXRAY_INSTALL_DIR:-$INSTALL_DIR}"
 SSL_ONLY=0
 [[ "${1:-}" == "--ssl-only" ]] && SSL_ONLY=1
 
-APP_DIR="/usr/local/lib/sshwsxray"
+APP_DIR="${SSHWSXRAY_APP_DIR:-/usr/local/lib/sshwsxray}"
 
 log_step() { echo -e "\n${CYAN}==> ${1}${NC}"; }
 
@@ -38,28 +38,22 @@ check_port_free() {  # <port> <svcname>
 }
 
 # ---------- Install packages ----------
+# Catatan: tidak ada lagi download script pihak ketiga. Limit IP dihitung
+# sendiri dari koneksi sshd (lihat ssh_user_ip_count di lib/monitor.sh).
 install_packages() {
     log_step "Update sistem & install dependencies"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -y >/dev/null
-    apt-get install -y curl wget tar jq python3 openssl cron \
-        openssh-server netfilter-persistent iptables-persistent \
-        speedtest-cli >/dev/null
-
-    log_step "Menginstall netsense (limit IP)"
-    if ! command -v netsense &>/dev/null; then
-        curl -sL "https://raw.githubusercontent.com/awaluff/netsense/main/netsense" \
-            -o /usr/local/bin/netsense && chmod +x /usr/local/bin/netsense \
-            && print_success "netsense terinstall" \
-            || print_warning "netsense gagal diinstall - limit IP via cron yang akan menutup sesi"
-    fi
+    apt-get install -y curl wget tar jq python3 openssl cron ca-certificates \
+        openssh-server speedtest-cli >/dev/null
 }
 
 # ---------- SSH config ----------
 configure_ssh() {
     log_step "Konfigurasi OpenSSH"
     mkdir -p /etc/ssh
-    cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak.$(date +%s)" 2>/dev/null
+    local backup="/etc/ssh/sshd_config.bak.$(date +%s)"
+    [[ -f /etc/ssh/sshd_config ]] && cp /etc/ssh/sshd_config "$backup" 2>/dev/null
     cat > /etc/ssh/sshd_config <<EOF
 Port 22
 ListenAddress 0.0.0.0
@@ -73,7 +67,20 @@ ClientAliveCountMax 3
 UseDNS no
 Subsystem sftp /usr/lib/openssh/sftp-server
 EOF
+    # Validasi dulu: config sshd yang rusak = tidak bisa login sama sekali.
+    if ! sshd -t -f /etc/ssh/sshd_config 2>/dev/null; then
+        print_error "sshd_config hasil instalasi tidak valid - dikembalikan ke config lama"
+        if [[ -f "$backup" ]]; then
+            cp "$backup" /etc/ssh/sshd_config
+        else
+            rm -f /etc/ssh/sshd_config
+        fi
+        return 1
+    fi
+    # simpan maksimal 5 backup sshd_config
+    ls -1t /etc/ssh/sshd_config.bak.* 2>/dev/null | tail -n +6 | xargs -r rm -f
     systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
+    return 0
 }
 
 # ---------- Bridge WebSocket kustom (pure Python, pengganti gost) ----------
@@ -83,10 +90,14 @@ install_sshws() {
     # SSH-WS memakai path standar '/' (tanpa path khusus); WS_PATH hanya untuk Xray
     local ws_port="${WS_PORT:-80}"
     local wss_port="${WSS_PORT:-443}"
+    local max_per_ip="${WS_MAX_PER_IP:-16}"
 
     # pastikan script bridge ada sebelum unit systemd dibuat
     mkdir -p "$APP_DIR"
-    install -m 644 "${SCRIPT_DIR}/lib/sshws.py" "${APP_DIR}/sshws.py"
+    if [[ "${SCRIPT_DIR}/lib/sshws.py" != "${APP_DIR}/sshws.py" ]]; then
+        install -m 644 "${SCRIPT_DIR}/lib/sshws.py" "${APP_DIR}/sshws.py"
+    fi
+    [[ -f "${APP_DIR}/sshws.py" ]] || { print_error "${APP_DIR}/sshws.py tidak ditemukan"; return 1; }
 
     # ---- websocket biasa (port 80) -> sshd ----
     cat > /etc/systemd/system/sshws.service <<EOF
@@ -96,7 +107,7 @@ After=network.target ssh.service
 
 [Service]
 Type=simple
-ExecStart=$(command -v python3) ${APP_DIR}/sshws.py --port ${ws_port} --target 127.0.0.1:22
+ExecStart=$(command -v python3) ${APP_DIR}/sshws.py --port ${ws_port} --target 127.0.0.1:22 --max-per-ip ${max_per_ip}
 Restart=always
 RestartSec=3
 NoNewPrivileges=true
@@ -114,7 +125,7 @@ After=network.target ssh.service
 
 [Service]
 Type=simple
-ExecStart=$(command -v python3) ${APP_DIR}/sshws.py --port ${wss_port} --target 127.0.0.1:22 --tls --cert ${INSTALL_DIR}/cert/fullchain.pem --key ${INSTALL_DIR}/cert/privkey.pem
+ExecStart=$(command -v python3) ${APP_DIR}/sshws.py --port ${wss_port} --target 127.0.0.1:22 --max-per-ip ${max_per_ip} --tls --cert ${INSTALL_DIR}/cert/fullchain.pem --key ${INSTALL_DIR}/cert/privkey.pem
 Restart=always
 RestartSec=3
 NoNewPrivileges=true
@@ -127,9 +138,32 @@ EOF
     systemctl daemon-reload
     if [[ -f /etc/systemd/system/sshws-tls.service ]]; then
         systemctl enable sshws sshws-tls
+        systemctl restart sshws-tls 2>/dev/null || true
     else
         systemctl enable sshws
     fi
+    systemctl restart sshws 2>/dev/null || true
+    return 0
+}
+
+# ---------- Firewall ----------
+# Tidak memaksa firewall apa pun; kalau ufw terpasang & aktif, port yang
+# dibutuhkan dibuka otomatis supaya tidak "sudah terpasang tapi ditolak".
+configure_firewall() {
+    log_step "Firewall"
+    local ports=("22" "80" "443" "${XRAY_VMESS_WS_PORT}" "${XRAY_VLESS_WS_PORT}" "${XRAY_TROJAN_WS_PORT}")
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "^Status: active"; then
+        local p
+        for p in "${ports[@]}"; do
+            [[ -z "$p" ]] && continue
+            ufw allow "$p"/tcp >/dev/null 2>&1
+        done
+        print_success "Port dibuka di ufw: ${ports[*]} (tcp)"
+        return 0
+    fi
+    print_warning "ufw tidak aktif - pastikan port berikut terbuka di firewall/security group VPS:"
+    print_warning "  ${ports[*]} (tcp)"
+    return 0
 }
 
 # ---------- xray-core ----------
@@ -173,15 +207,12 @@ EOF
 }
 
 # ---------- Init data dir ----------
+# ensure_db_files() (lib/common.sh) hanya MEMBUAT file yang belum ada.
+# Versi lama memakai ': > file' sehingga menjalankan ulang installer - atau
+# "Install/perbarui sertifikat SSL" dari menu - menghapus semua akun.
 init_data() {
     log_step "Inisialisasi direktori data"
-    mkdir -p "$INSTALL_DIR"
-    chmod 700 "$INSTALL_DIR"
-    : > "$INSTALL_DIR/ssh_users.db"
-    : > "$INSTALL_DIR/xray_users.db"
-    : > "$INSTALL_DIR/xray_traffic.db"
-    : > "$INSTALL_DIR/trial_users.db"
-    chmod 600 "$INSTALL_DIR/"*.db
+    ensure_db_files
 }
 
 # ---------- Cron jobs ----------
@@ -199,11 +230,20 @@ EOF
 install_app_files() {
     log_step "Install aplikasi ke ${APP_DIR}"
     mkdir -p "$APP_DIR/lib"
-    cp "${SCRIPT_DIR}/menu.sh" "$APP_DIR/menu.sh"
-    cp "${SCRIPT_DIR}/lib/"*.sh "$APP_DIR/lib/"
-    cp "${SCRIPT_DIR}/lib/"*.py "$APP_DIR/lib/"
+    if [[ "$SCRIPT_DIR" != "$APP_DIR" ]]; then
+        # setup.sh & uninstall.sh ikut disalin: menu "Install/perbarui SSL"
+        # menjalankan ${APP_DIR}/setup.sh, jadi file itu harus ada di sana.
+        cp -f "${SCRIPT_DIR}/menu.sh" "$APP_DIR/menu.sh"
+        cp -f "${SCRIPT_DIR}/setup.sh" "$APP_DIR/setup.sh"
+        cp -f "${SCRIPT_DIR}/uninstall.sh" "$APP_DIR/uninstall.sh" 2>/dev/null || true
+        cp -f "${SCRIPT_DIR}/lib/"*.sh "$APP_DIR/lib/"
+        cp -f "${SCRIPT_DIR}/lib/"*.py "$APP_DIR/lib/"
+    fi
     chmod 755 "$APP_DIR/menu.sh" "$APP_DIR/lib/"*.sh
-    chmod 644 "$APP_DIR/lib/"*.py
+    [[ -f "$APP_DIR/setup.sh" ]] && chmod 755 "$APP_DIR/setup.sh"
+    [[ -f "$APP_DIR/uninstall.sh" ]] && chmod 755 "$APP_DIR/uninstall.sh"
+    chmod 644 "$APP_DIR/lib/"*.py 2>/dev/null || true
+    return 0
 }
 
 # ---------- Cron payload (separate file, no menu deps) ----------
@@ -233,12 +273,25 @@ install_symlink() {
 # ============================================================
 # Main
 # ============================================================
+main() {
 if [[ $SSL_ONLY -eq 1 ]]; then
     init_data
     load_config
     apply_config_defaults
-    issue_ssl
-    exit $?
+    # SSL bisa ditambahkan belakangan SETELAH instalasi awal: unit WSS dan
+    # inbound Trojan belum ada, jadi keduanya harus dipasang/di-render di sini.
+    if ! issue_ssl; then
+        print_error "SSL gagal - tidak ada perubahan yang diterapkan"
+        return 1
+    fi
+    install_sshws
+    install_app_files
+    source "${SCRIPT_DIR}/lib/xray.sh"
+    if xray_render_config; then
+        xray_safe_restart
+    fi
+    print_success "SSL terpasang: wss://${WSS_PORT} (SSH) dan inbound Trojan WS aktif"
+    return 0
 fi
 
 echo -e "${CYAN}==============================================${NC}"
@@ -248,7 +301,7 @@ echo -e "${CYAN}==============================================${NC}"
 
 if ! detect_os; then
     print_error "OS tidak didukung (butuh Debian atau Ubuntu)."
-    exit 1
+    return 1
 fi
 print_info "OS terdeteksi: ${OS_ID} ${OS_VERSION}"
 print_info "Arsitektur   : $(uname -m) ($(detect_arch))"
@@ -258,7 +311,7 @@ read -rp "Domain untuk SSL (kosongkan jika tanpa domain): " DOMAIN_INPUT
 DOMAIN_INPUT="${DOMAIN_INPUT:-}"
 if [[ -n "$DOMAIN_INPUT" ]]; then
     if ! [[ "$DOMAIN_INPUT" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
-        print_error "Format domain tidak valid"; exit 1
+        print_error "Format domain tidak valid"; return 1
     fi
 fi
 
@@ -271,12 +324,21 @@ if [[ -n "$DOMAIN_INPUT" ]]; then
     echo "$DOMAIN_INPUT" > "$INSTALL_DIR/domain"
 fi
 apply_config_defaults
-for key in WS_PATH WS_PORT WSS_PORT XRAY_VMESS_WS_PORT XRAY_VLESS_WS_PORT \
-           XRAY_TROJAN_WS_PORT XRAY_API_PORT IP_LIMIT TRIAL_HOURS; do
+for key in WS_PATH WS_PORT WSS_PORT WS_MAX_PER_IP XRAY_VMESS_WS_PORT \
+           XRAY_VLESS_WS_PORT XRAY_TROJAN_WS_PORT XRAY_API_PORT \
+           IP_LIMIT TRIAL_HOURS; do
     save_config "$key" "${!key}"
 done
 
-configure_ssh
+# Port yang dibutuhkan harus bebas (peringatan, bukan penghenti)
+check_port_free "$WS_PORT" "sshws"
+check_port_free "$WSS_PORT" "sshws-tls"
+check_port_free "$XRAY_VMESS_WS_PORT" "vmess ws"
+check_port_free "$XRAY_VLESS_WS_PORT" "vless ws"
+check_port_free "$XRAY_TROJAN_WS_PORT" "trojan ws"
+check_port_free "$XRAY_API_PORT" "xray api"
+
+configure_ssh || print_warning "Konfigurasi sshd dilewati - config lama tetap dipakai"
 issue_ssl || true   # SSL dulu: unit sshws-tls butuh cert
 install_sshws
 install_xray
@@ -291,13 +353,19 @@ elif [[ -n "$DOMAIN_INPUT" && -f "/etc/letsencrypt/live/$DOMAIN_INPUT/fullchain.
     chmod 600 "$INSTALL_DIR/cert/"*.pem
     save_config CERT_DIR "$INSTALL_DIR/cert"
 fi
+init_data
 
 # Render initial xray config (inbounds only; clients added via menu)
 source "${SCRIPT_DIR}/lib/xray.sh"
-xray_render_config
-xray_validate && systemctl restart xray
+if xray_render_config && xray_validate; then
+    systemctl restart xray
+else
+    print_error "Config Xray tidak valid - service xray tidak di-restart"
+fi
 systemctl restart sshws 2>/dev/null
 systemctl restart sshws-tls 2>/dev/null || true
+
+configure_firewall
 
 install_app_files
 install_cron
@@ -328,3 +396,11 @@ echo -e " Trojan WS : port ${XRAY_TROJAN_WS_PORT} (path /${WS_PATH}, TLS)"
 echo -e ""
 echo -e " Jalankan menu : ${BOLD}sshwsxray${NC}"
 echo -e "${GREEN}==============================================${NC}"
+return 0
+}
+
+# Jalankan main hanya bila dieksekusi langsung; saat di-source (mis. oleh test)
+# fungsi-fungsi installer bisa dipanggil tanpa menjalankan instalasi.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

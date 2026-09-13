@@ -53,17 +53,41 @@ check "save_config sync var di shell" "$DOMAIN" "contoh.com"
 save_config DOMAIN "baru.com"
 check "save_config update existing" "$DOMAIN" "baru.com"
 
-# ---------- db add/del (pipe format) ----------
+# ---------- save_config escaping (regression) ----------
+# nilai dengan & | # \ " harus tidak merusak file maupun gagal senyap
+for raw in 'a&b' 'p|q' 'hash#tag' 'back\slash' 'quote"x' 'koma,titik'; do
+    save_config DOMAIN "$raw"
+    # baca ulang dari file (subshell) -> membuktikan file tetap valid
+    got=$(unset DOMAIN; . "$CONFIG_FILE" >/dev/null 2>&1; printf '%s' "$DOMAIN")
+    check "save_config round-trip: $raw" "$got" "$raw"
+done
+save_config DOMAIN "contoh.com"
+
+# ---------- db add (pipe format) ----------
 DB="$SANDBOX/test.db"
 db_add "$DB" "vmess|uuid-1|alice|2026-09-13|2026-10-13 12:30|2"
 db_add "$DB" "vless|uuid-2|bob|2026-09-13|2026-10-13|2"
 check "db_add baris" "$(wc -l < "$DB")" "2"
 # kolom expired dengan jam tidak menggeser field
 check "field ke-6 tetap iplimit" "$(awk -F'|' '$3=="alice"{print $6}' "$DB")" "2"
-db_del "$DB" "alice"
-check "db_del by name" "$(wc -l < "$DB")" "1"
-grep -q "bob" "$DB" && r=0 || r=1
-check_true "db_del menyisakan bob" "$r"
+
+# ---------- ensure_db_files: tidak boleh menimpa data yang ada ----------
+ensure_db_files
+echo "budi|-|2026-09-13|2026-10-13|2" > "$INSTALL_DIR/ssh_users.db"
+ensure_db_files
+check "ensure_db_files tidak mengosongkan DB" "$(wc -l < "$INSTALL_DIR/ssh_users.db")" "1"
+check "ensure_db_files membuat trial_users.db" "$( [[ -f "$INSTALL_DIR/trial_users.db" ]] && echo ada)" "ada"
+check "ensure_db_files mode DB 600" "$(stat -c %a "$INSTALL_DIR/ssh_users.db")" "600"
+
+# ---------- is_int ----------
+check "is_int 30" "$(is_int 30 && echo yes || echo no)" "yes"
+check "is_int abc" "$(is_int abc && echo yes || echo no)" "no"
+check "is_int kosong" "$(is_int "" && echo yes || echo no)" "no"
+
+# ---------- is_expired defensif untuk nilai rusak ----------
+check "is_expired('') -> belum expired" "$(is_expired "" && echo expired || echo aman)" "aman"
+check "is_expired('abc') -> belum expired" "$(is_expired "abc" && echo expired || echo aman)" "aman"
+check "days_left('') tidak error" "$(days_left "" 2>/dev/null)" "0"
 
 # ---------- fmt_bytes ----------
 check "fmt_bytes B"  "$(fmt_bytes 512)"    "512 B"

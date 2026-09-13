@@ -88,3 +88,39 @@ bytes=$(xray_user_traffic "11111111-2222-3333-4444-555555555555")
 
 # validate must pass JSON check even without xray binary
 xray_validate && echo "VALIDATE OK"
+
+echo "=== Skenario 3: akumulasi traffic per-user (regression prefix user>>>) ==="
+UUID="11111111-2222-3333-4444-555555555555"
+: > "$XRAY_TRAFFIC_DB"
+# tiru output xray_stats_query (format: name<TAB>value)
+xray_stats_query() {
+    printf 'user>>>%s@vmess-ws-in>>>traffic>>>uplink\t4096\n' "$UUID"
+    printf 'user>>>%s@vmess-ws-in>>>traffic>>>downlink\t2048\n' "$UUID"
+    printf 'inbound>>>vmess-ws-in>>>traffic>>>uplink\t999999\n'
+}
+xray_traffic_update
+got=$(xray_user_traffic "$UUID")
+[[ "$got" == "6144" ]] && echo "TRAFFIC AKUMULASI OK ($got)" || { echo "TRAFFIC AKUMULASI FAIL: '$got' (harus 6144)"; exit 1; }
+# delta berikutnya harus DITAMBAHKAN, bukan menimpa
+xray_stats_query() { printf 'user>>>%s@vmess-ws-in>>>traffic>>>uplink\t1000\n' "$UUID"; }
+xray_traffic_update
+got=$(xray_user_traffic "$UUID")
+[[ "$got" == "7144" ]] && echo "TRAFFIC DELTA OK ($got)" || { echo "TRAFFIC DELTA FAIL: '$got' (harus 7144)"; exit 1; }
+
+echo "=== Skenario 4: query stats tanpa netcat ==="
+if python3 "$PROJECT_ROOT/lib/xray_proto.py" query 1 >/dev/null 2>&1; then
+    echo "QUERY OFFLINE FAIL (seharusnya exit 1 saat port tertutup)"; exit 1
+fi
+echo "QUERY OFFLINE OK (exit 1, tidak menggantung)"
+
+echo "=== Skenario 5: rollback config bila hasil render tidak valid ==="
+cp "$XRAY_CONFIG" "$SANDBOX/prev.json"
+xray_validate() { return 1; }   # paksa validasi gagal
+if xray_render_config; then
+    echo "ROLLBACK FAIL (render seharusnya ditolak)"; exit 1
+fi
+if cmp -s "$XRAY_CONFIG" "$SANDBOX/prev.json"; then
+    echo "ROLLBACK OK (config lama dipertahankan)"
+else
+    echo "ROLLBACK FAIL (config lama tertimpa)"; exit 1
+fi

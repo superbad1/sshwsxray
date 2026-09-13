@@ -15,15 +15,32 @@ _xray_get_field() {  # _xray_get_field <proto> <user> <field_number>
 }
 
 _xray_update_field() {  # _xray_update_field <proto> <user> <field_number> <new_value>
-    local proto="$1" user="$2" field="$3" value="$4"
-    awk -F'|' -v p="$proto" -v u="$user" -v f="$field" -v v="$value" \
+    local proto="$1" user="$2" field="$3" value="$4" tmp
+    [[ -f "$XRAY_DB" ]] || return 1
+    tmp=$(mktemp)
+    if awk -F'|' -v p="$proto" -v u="$user" -v f="$field" -v v="$value" \
         'BEGIN{OFS="|"} $1==p && $3==u {$f=v} {print}' \
-        "$XRAY_DB" > "${XRAY_DB}.tmp" && mv "${XRAY_DB}.tmp" "$XRAY_DB"
+        "$XRAY_DB" > "$tmp"; then
+        mv "$tmp" "$XRAY_DB"
+        chmod 600 "$XRAY_DB" 2>/dev/null
+    else
+        rm -f "$tmp"
+        return 1
+    fi
 }
 
 _xray_delete_record() {  # _xray_delete_record <proto> <user>
-    awk -F'|' -v p="$1" -v u="$2" '$1==p && $3==u {next} {print}' \
-        "$XRAY_DB" > "${XRAY_DB}.tmp" && mv "${XRAY_DB}.tmp" "$XRAY_DB"
+    local tmp
+    [[ -f "$XRAY_DB" ]] || return 1
+    tmp=$(mktemp)
+    if awk -F'|' -v p="$1" -v u="$2" '$1==p && $3==u {next} {print}' \
+        "$XRAY_DB" > "$tmp"; then
+        mv "$tmp" "$XRAY_DB"
+        chmod 600 "$XRAY_DB" 2>/dev/null
+    else
+        rm -f "$tmp"
+        return 1
+    fi
 }
 
 # ---------- Create account ----------
@@ -52,8 +69,13 @@ xray_user_create() {
 
     read -rp "Masa aktif (hari) [30]: " days
     [[ -z "$days" ]] && days=30
-    read -rp "Batas IP [${IP_LIMIT}]: " iplimit
-    [[ -z "$iplimit" ]] && iplimit=$IP_LIMIT
+    if ! is_int "$days"; then
+        print_error "Masa aktif harus berupa angka (hari)"
+        pause_menu; return 1
+    fi
+    # Catatan: Xray tidak punya penegakan limit IP per akun, jadi field ini
+    # sengaja tidak ditawarkan (biar tidak menjanjikan sesuatu yang tidak jalan).
+    local iplimit=0
 
     local uuid
     uuid=$(_xray_gen_uuid) || { pause_menu; return 1; }
@@ -66,7 +88,7 @@ xray_user_create() {
     echo ""
     print_success "Akun ${proto} '${user}' dibuat (expired ${expire}, limit ${iplimit} IP)"
     xray_user_show "$proto" "$user"
-    tg_send "✅ <b>AKUN ${proto^^} BARU</b>%0AUser: ${user}%0AExpired: ${expire}"
+    tg_send "✅ <b>AKUN ${proto^^} BARU</b>%0AUser: $(tg_escape "$user")%0AExpired: ${expire}"
     pause_menu
 }
 
@@ -94,7 +116,7 @@ xray_user_trial() {
     xray_render_config && xray_safe_restart
     print_success "Trial ${proto} '${user}' dibuat (${TRIAL_HOURS} jam, 1 IP)"
     xray_user_show "$proto" "$user"
-    tg_send "🧪 <b>TRIAL ${proto^^}</b>%0AUser: ${user}%0AExpired: ${expire}"
+    tg_send "🧪 <b>TRIAL ${proto^^}</b>%0AUser: $(tg_escape "$user")%0AExpired: ${expire}"
     pause_menu
 }
 
@@ -111,6 +133,10 @@ xray_user_renew() {
     fi
     read -rp "Tambah masa aktif (hari) [30]: " days
     [[ -z "$days" ]] && days=30
+    if ! is_int "$days"; then
+        print_error "Masa aktif harus berupa angka (hari)"
+        pause_menu; return 1
+    fi
     local current expire
     current=$(_xray_get_field "$proto" "$user" 5)
     if [[ -n "$current" ]] && is_expired "$current"; then
@@ -120,7 +146,7 @@ xray_user_renew() {
     fi
     _xray_update_field "$proto" "$user" 5 "$expire"
     print_success "Akun ${proto} '${user}' diperpanjang sampai ${expire}"
-    tg_send "🔄 <b>RENEW ${proto^^}</b>%0AUser: ${user}%0AExpired baru: ${expire}"
+    tg_send "🔄 <b>RENEW ${proto^^}</b>%0AUser: $(tg_escape "$user")%0AExpired baru: ${expire}"
     pause_menu
 }
 
@@ -140,7 +166,7 @@ xray_user_delete() {
     sed -i "/^[^|]*|${user}|/d" "$TRIAL_DB" 2>/dev/null
     xray_render_config && xray_safe_restart
     print_success "Akun ${proto} '${user}' dihapus"
-    tg_send "🗑 <b>AKUN ${proto^^} DIHAPUS</b>%0AUser: ${user}"
+    tg_send "🗑 <b>AKUN ${proto^^} DIHAPUS</b>%0AUser: $(tg_escape "$user")"
     pause_menu
 }
 
@@ -167,7 +193,8 @@ xray_user_list() {  # xray_user_list [brief|full]
             status="${GREEN}ACTIVE${NC}"
         fi
         traffic=$(xray_user_traffic "$uuid" 2>/dev/null || echo 0)
-        printf " %-7s %-16b %-20s %-5s %-10s\n" "$proto" "$status" "$expired" "${iplimit:-1}" "$(fmt_bytes "$traffic")"
+        # limit IP hanya berlaku untuk akun SSH (Xray tidak mendukungnya)
+        printf " %-7s %-16b %-20s %-5s %-10s\n" "$proto" "$status" "$expired" "-" "$(fmt_bytes "$traffic")"
     done < "$XRAY_DB"
     echo -e "${CYAN}------------------------------------------------------------${NC}"
 }
@@ -186,10 +213,9 @@ xray_user_show() {  # xray_user_show <proto> <user>
     local rec
     rec=$(awk -F'|' -v p="$proto" -v u="$user" '$1==p && $3==u {print; exit}' "$XRAY_DB" 2>/dev/null)
     [[ -z "$rec" ]] && { print_error "Akun tidak ditemukan"; return 1; }
-    local uuid expired iplimit
+    local uuid expired
     uuid=$(_xray_get_field "$proto" "$user" 2)
     expired=$(_xray_get_field "$proto" "$user" 5)
-    iplimit=$(_xray_get_field "$proto" "$user" 6)
 
     local domain
     domain=$(get_domain)
@@ -200,7 +226,7 @@ xray_user_show() {  # xray_user_show <proto> <user>
     echo -e " ${BOLD}AKUN ${proto^^}: ${user}${NC}"
     echo -e " UUID/Pass : ${uuid}"
     echo -e " Expired   : ${expired}"
-    echo -e " Limit IP  : ${iplimit}"
+    echo -e " Limit IP  : tidak berlaku (limit IP hanya untuk akun SSH)"
     echo -e "${CYAN}----------------------------------------------${NC}"
 
     if [[ "$proto" == "vmess" ]]; then

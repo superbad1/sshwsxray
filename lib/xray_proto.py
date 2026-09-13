@@ -2,10 +2,15 @@
 """Minimal protobuf encode/decode for Xray gRPC StatsService (no grpcio needed).
 
 Used by lib/xray.sh to talk to the dokodemo-door API inbound:
-  encode <pattern>  -> write gRPC-framed QueryStatsRequest to stdout
-  decode <b64>      -> parse base64 gRPC frame, print "name###value" lines
+  encode <pattern>          -> write gRPC-framed QueryStatsRequest to stdout
+  decode <b64>              -> parse base64 gRPC frame, print "name###value### N"
+  query <port> [pattern]    -> kirim request via TCP sendiri (tanpa netcat)
+
+`query` ada supaya script tidak bergantung pada binary `nc` yang tidak
+terpasang secara default di Debian/Ubuntu minimal.
 """
 import base64
+import socket
 import struct
 import sys
 
@@ -54,6 +59,46 @@ def _read_varint(d: bytes, i: int):
 def _read_lp(d: bytes, i: int):
     n, i = _read_varint(d, i)
     return d[i:i + n], i + n
+
+
+def iter_grpc_frames(data: bytes):
+    """Yield setiap pesan gRPC utuh (termasuk 5 byte header) dari stream."""
+    i = 0
+    while i + 5 <= len(data):
+        length = struct.unpack(">I", data[i + 1:i + 5])[0]
+        end = i + 5 + length
+        if end > len(data):
+            break
+        yield data[i:end]
+        i = end
+
+
+def query(port: int, pattern: str = "", timeout: float = 5.0) -> int:
+    """Hubungi StatsService via TCP, cetak "name<TAB>value" per statistik."""
+    frame = encode_query(pattern)
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
+            sock.sendall(frame)
+            sock.settimeout(timeout)
+            chunks = []
+            while True:
+                try:
+                    data = sock.recv(65536)
+                except (socket.timeout, TimeoutError):
+                    break
+                if not data:
+                    break
+                chunks.append(data)
+    except OSError:
+        return 1
+    raw = b"".join(chunks)
+    if not raw:
+        return 1
+    frames = list(iter_grpc_frames(raw)) or [raw]
+    for msg in frames:
+        for name, value in decode_response(msg):
+            print("{0}\t{1}".format(name, value))
+    return 0
 
 
 def decode_response(data: bytes):
@@ -111,6 +156,12 @@ def main():
         for name, value in decode_response(data):
             print(f"{name}###value### {value}")
         return 0
+    if cmd == "query":
+        if len(sys.argv) < 3 or not sys.argv[2].isdigit():
+            print("usage: xray_proto.py query <port> [pattern]", file=sys.stderr)
+            return 1
+        pattern = sys.argv[3] if len(sys.argv) > 3 else ""
+        return query(int(sys.argv[2]), pattern)
     print(f"unknown command: {cmd}", file=sys.stderr)
     return 1
 

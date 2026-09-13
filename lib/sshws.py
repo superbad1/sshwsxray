@@ -26,6 +26,9 @@ Usage:
 Notes:
     * Auth is NOT handled here: sshd authenticates the SSH session, so the
       Linux user/expiry/IP-limit rules apply exactly like plain SSH.
+    * Path standar `/`: semua path diterima (lihat --path untuk mode ketat).
+    * Ada batas koneksi global (--max-connections) dan per-IP (--max-per-ip)
+      supaya satu sumber tidak menghabiskan kuota koneksi.
 """
 from __future__ import annotations
 
@@ -98,6 +101,13 @@ def http_error(writer: asyncio.StreamWriter, code: int, text: str) -> None:
     )
 
 
+def peer_ip(peer) -> str:
+    """Ambil alamat IP dari hasil get_extra_info('peername')."""
+    if isinstance(peer, (tuple, list)) and peer:
+        return str(peer[0])
+    return "unknown"
+
+
 def tune(sock: Optional[socket.socket]) -> None:
     """Low latency matters for interactive SSH."""
     if sock is None:
@@ -116,9 +126,11 @@ async def pump(src: asyncio.StreamReader, dst: asyncio.StreamWriter) -> None:
     while True:
         data = await src.read(CHUNK)
         if not data:
+            # Half-close: write_eof() TIDAK didukung transport TLS
+            # (raise NotImplementedError), jadi kegagalannya diabaikan.
             try:
                 dst.write_eof()
-            except (OSError, RuntimeError):
+            except (OSError, RuntimeError, NotImplementedError):
                 pass
             return
         dst.write(data)
@@ -257,6 +269,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--handshake-timeout", type=float, default=10.0)
     p.add_argument("--connect-timeout", type=float, default=10.0)
     p.add_argument("--max-connections", type=int, default=1024)
+    p.add_argument(
+        "--max-per-ip",
+        type=int,
+        default=16,
+        help="batas koneksi bersamaan per alamat IP (0 = tanpa batas)",
+    )
     p.add_argument("--verbose", "-v", action="store_true")
     return p
 
@@ -273,10 +291,32 @@ async def run(args: argparse.Namespace) -> None:
         ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
 
     sem = asyncio.Semaphore(args.max_connections)
+    per_ip: dict = {}
 
     async def wrapped(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         async with sem:
-            await handle_client(reader, writer, args)
+            if args.max_per_ip <= 0:
+                await handle_client(reader, writer, args)
+                return
+            ip = peer_ip(writer.get_extra_info("peername"))
+            # batas per-IP mencegah satu sumber memakai seluruh kuota koneksi;
+            # tidak ada await di antara cek dan increment sehingga aman.
+            if per_ip.get(ip, 0) >= args.max_per_ip:
+                log.warning("batas %d koneksi per IP tercapai (%s)", args.max_per_ip, ip)
+                try:
+                    writer.close()
+                except OSError:
+                    pass
+                return
+            per_ip[ip] = per_ip.get(ip, 0) + 1
+            try:
+                await handle_client(reader, writer, args)
+            finally:
+                remaining = per_ip.get(ip, 1) - 1
+                if remaining > 0:
+                    per_ip[ip] = remaining
+                else:
+                    per_ip.pop(ip, None)
 
     server = await asyncio.start_server(
         wrapped, host=args.listen, port=args.port, ssl=ssl_ctx, limit=MAX_HEADER

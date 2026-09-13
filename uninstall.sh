@@ -16,7 +16,10 @@ if [[ $? -ne 0 ]]; then
     exit 0
 fi
 
-echo -e "\n${CYAN}==> Stop & disable services${NC}"
+echo -e "\n${CYAN}==> Stop cron & services${NC}"
+# cron dimatikan lebih dulu supaya tidak ada job yang jalan di tengah uninstall
+rm -f /etc/cron.d/sshwsxray
+pkill -f sshwsxray-cron 2>/dev/null
 systemctl stop sshws sshws-tls xray 2>/dev/null
 systemctl disable sshws sshws-tls 2>/dev/null
 systemctl stop xray 2>/dev/null
@@ -37,10 +40,14 @@ else
 fi
 
 echo -e "\n${CYAN}==> Hapus binary & cron${NC}"
-rm -f /usr/local/bin/gost /usr/local/bin/netsense   # gost = versi lama
+rm -f /usr/local/bin/gost /usr/local/bin/netsense   # sisa versi lama
 rm -f /usr/local/bin/sshwsxray /usr/local/bin/sshwsxray-cron
 rm -f /etc/cron.d/sshwsxray
 rm -rf /usr/local/lib/sshwsxray
+
+# hook renew certbot milik script ini ikut dibersihkan, kalau tidak akan
+# mencoba me-restart service yang sudah dihapus setiap kali cert diperbarui
+rm -f /etc/letsencrypt/renewal-hooks/deploy/sshwsxray.sh
 
 echo -e "\n${CYAN}==> Hapus data${NC}"
 rm -rf /etc/sshwsxray
