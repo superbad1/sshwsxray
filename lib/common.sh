@@ -16,7 +16,8 @@ NC='\033[0m'
 
 # ---------- Constants ----------
 INSTALL_DIR="${SSHWSXRAY_INSTALL_DIR:-/etc/sshwsxray}"
-BIN_DIR="/usr/local/bin"
+# BIN_DIR bisa di-override supaya test bisa memasang symlink di sandbox.
+BIN_DIR="${SSHWSXRAY_BIN_DIR:-/usr/local/bin}"
 # Direktori aplikasi hasil instalasi (install.sh, menu.sh, lib/, sshws.py).
 # Dipakai installer, menu, dan lib/bridge.sh - jadi didefinisikan di sini.
 APP_DIR="${SSHWSXRAY_APP_DIR:-/usr/local/lib/sshwsxray}"

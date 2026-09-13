@@ -41,7 +41,7 @@ fi
 
 echo -e "\n${CYAN}==> Hapus binary & cron${NC}"
 rm -f /usr/local/bin/gost /usr/local/bin/netsense   # sisa versi lama
-rm -f /usr/local/bin/sshwsxray /usr/local/bin/sshwsxray-cron
+rm -f /usr/local/bin/sshwsxray /usr/local/bin/menu /usr/local/bin/sshwsxray-cron
 rm -f /etc/cron.d/sshwsxray
 rm -rf /usr/local/lib/sshwsxray
 

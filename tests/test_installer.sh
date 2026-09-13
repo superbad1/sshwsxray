@@ -214,6 +214,22 @@ unguarded=$(grep -nhE '^[[:space:]]*systemctl ' "$PROJECT_ROOT/install.sh" "$PRO
     | grep -vE '\|\| true|\|\| print_warning|\|\| systemctl|is-active|daemon-reload' | wc -l)
 check "semua systemctl di installer tahan gagal" "$unguarded" "0"
 
+# ---------- K10: symlink menu & alias pendek ----------
+# BIN_DIR diarahkan ke sandbox supaya test ini tidak menulis ke /usr/local/bin.
+BIN_DIR="$SANDBOX/bin"
+mkdir -p "$BIN_DIR" "$APP_DIR"
+printf '#!/bin/bash\necho menu\n' > "$APP_DIR/menu.sh"
+install_symlink
+check "symlink: sshwsxray dibuat" "$(readlink "$BIN_DIR/sshwsxray")" "$APP_DIR/menu.sh"
+check "symlink: alias 'menu' dibuat" "$(readlink "$BIN_DIR/menu")" "$APP_DIR/menu.sh"
+check "symlink: 'menu' bisa dieksekusi" "$([[ -x "$BIN_DIR/menu" ]] && echo ya || echo tidak)" "ya"
+check "symlink: sandbox BIN_DIR dipakai (bukan /usr/local/bin)" \
+    "$([[ "$BIN_DIR" == "$SANDBOX/bin" ]] && echo ya || echo tidak)" "ya"
+check "config: BIN_DIR mengikuti SSHWSXRAY_BIN_DIR" \
+    "$(SSHWSXRAY_BIN_DIR=/opt/ujicoba bash -c "source '$PROJECT_ROOT/lib/common.sh' >/dev/null 2>&1; echo \$BIN_DIR")" "/opt/ujicoba"
+check "uninstall menghapus symlink menu" \
+    "$(grep -c 'rm -f /usr/local/bin/sshwsxray /usr/local/bin/menu' "$PROJECT_ROOT/uninstall.sh")" "1"
+
 echo
 if (( failures == 0 )); then
     echo "ALL INSTALLER TESTS PASSED"

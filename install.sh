@@ -150,7 +150,7 @@ run_downloaded_copy() {
     else
         warn "Tidak ada terminal untuk menjawab pertanyaan - instalasi lanjut
       dengan jawaban kosong (tanpa domain/SSL). SSL bisa ditambahkan nanti
-      lewat menu: sudo sshwsxray -> 5 -> 8"
+      lewat menu: sudo menu -> 5 -> 8"
         bash "$SCRIPT_DIR/install.sh" || rc=$?
     fi
     return "$rc"
@@ -358,8 +358,9 @@ CRONEOF
 }
 
 install_symlink() {
-    ln -sf "${APP_DIR}/menu.sh" "${BIN_DIR}/sshwsxray"
     chmod +x "${APP_DIR}/menu.sh"
+    ln -sf "${APP_DIR}/menu.sh" "${BIN_DIR}/sshwsxray"
+    ln -sf "${APP_DIR}/menu.sh" "${BIN_DIR}/menu"
 }
 
 # ============================================================
@@ -485,7 +486,7 @@ install_all() {
     echo -e "   Trojan : path /${XRAY_TROJAN_WS_PATH}"
     echo -e " Port langsung Xray (opsional): ${XRAY_VMESS_WS_PORT}/${XRAY_VLESS_WS_PORT} ws, ${XRAY_TROJAN_WS_PORT} tls"
     echo -e ""
-    echo -e " Jalankan menu : ${BOLD}sshwsxray${NC}"
+    echo -e " Jalankan menu : ${BOLD}menu${NC}  (alias: sshwsxray)"
     echo -e "${GREEN}==============================================${NC}"
     return 0
 }

@@ -118,7 +118,7 @@ cara ia dipanggil:
 Mode in-place itulah yang berjalan saat bootstrap dan saat menu Pengaturan → 8
 memanggil `SSL_ONLY=1 /usr/local/lib/sshwsxray/install.sh`. Tidak ada git,
 tidak ada arsip, tidak ada ekstrak, tidak ada argumen — semua pengaturan
-ditanyakan saat instalasi atau diubah kapan saja lewat menu `sudo sshwsxray`.
+ditanyakan saat instalasi atau diubah kapan saja lewat menu `sudo menu`.
 
 Yang ditangani bagian bootstrap:
 - menolak jalan bila bukan root, dan berhenti lebih awal bila OS bukan Debian/Ubuntu
@@ -131,7 +131,7 @@ Yang ditangani bagian instalasi:
 2. Install dependencies (curl, jq, python3, openssl, cron, openssh-server, speedtest-cli)
 3. Tanya domain untuk SSL (opsional, harus sudah A-record ke IP VPS)
 4. Konfigurasi sshd (port 22), pasang bridge WebSocket (`sshws`/`sshws-tls`), Xray-core, certbot
-5. Render config Xray, pasang cron, salin aplikasi ke `/usr/local/lib/sshwsxray`, buat symlink `sshwsxray`
+5. Render config Xray, pasang cron, salin aplikasi ke `/usr/local/lib/sshwsxray`, buat symlink `menu` dan `sshwsxray`
 
 Daftar berkas yang diunduh dipatok di dalam `install.sh`; `tests/test_install.sh`
 membandingkannya dengan isi repo, jadi berkas baru di `lib/` yang lupa
@@ -143,8 +143,11 @@ Jalankan tanpa mengisi domain. wss/443 dan Trojan TLS tidak aktif; VMess WS dan 
 ## Penggunaan
 
 ```bash
-sudo sshwsxray
+sudo menu
 ```
+
+`menu` dan `sshwsxray` sama-sama symlink ke `/usr/local/lib/sshwsxray/menu.sh`;
+pakai yang mana saja.
 
 | Menu | Isi |
 |------|-----|
@@ -169,7 +172,7 @@ sudo sshwsxray
 | 10087/10089/10090/10092 | _(tidak dipakai — gRPC & Reality dihapus)_ | — |
 
 Klien cukup memakai **80 atau 443** untuk semuanya; path acak yang menentukan
-protokolnya (lihat `sudo sshwsxray` → 5, atau menu Xray → 6 untuk link akun).
+protokolnya (lihat `sudo menu` → 5, atau menu Xray → 6 untuk link akun).
 Port 10086/10088/10091 tetap terbuka bila ingin menyambung langsung.
 
 Semua port dapat diubah di `/etc/sshwsxray/config` lalu restart service.
