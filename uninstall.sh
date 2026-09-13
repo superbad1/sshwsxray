@@ -17,13 +17,13 @@ if [[ $? -ne 0 ]]; then
 fi
 
 echo -e "\n${CYAN}==> Stop & disable services${NC}"
-systemctl stop gost-websocket gost-websocket-tls xray 2>/dev/null
-systemctl disable gost-websocket gost-websocket-tls 2>/dev/null
+systemctl stop sshws sshws-tls xray 2>/dev/null
+systemctl disable sshws sshws-tls 2>/dev/null
 systemctl stop xray 2>/dev/null
 
 echo -e "\n${CYAN}==> Hapus systemd unit${NC}"
-rm -f /etc/systemd/system/gost-websocket.service
-rm -f /etc/systemd/system/gost-websocket-tls.service
+rm -f /etc/systemd/system/sshws.service
+rm -f /etc/systemd/system/sshws-tls.service
 systemctl daemon-reload
 
 echo -e "\n${CYAN}==> Hapus Xray${NC}"
@@ -37,7 +37,7 @@ else
 fi
 
 echo -e "\n${CYAN}==> Hapus binary & cron${NC}"
-rm -f /usr/local/bin/gost /usr/local/bin/netsense
+rm -f /usr/local/bin/gost /usr/local/bin/netsense   # gost = versi lama
 rm -f /usr/local/bin/sshwsxray /usr/local/bin/sshwsxray-cron
 rm -f /etc/cron.d/sshwsxray
 rm -rf /usr/local/lib/sshwsxray

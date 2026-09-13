@@ -7,15 +7,13 @@ Panduan menghubungkan aplikasi klien ke server yang di-install sshwsxray autoscr
 | Layanan | Port | TLS | Catatan |
 |---------|------|-----|---------|
 | SSH langsung | 22 | - | client SSH biasa |
-| SSH over WS | 80 | tidak | path `/<WS_PATH>` |
-| SSH over WSS | 443 | ya | path `/<WS_PATH>` |
+| SSH over WS | 80 | tidak | path standar `/` (tanpa path khusus) |
+| SSH over WSS | 443 | ya | path standar `/` (tanpa path khusus) |
 | VMess WS | 10086 | tidak | path `/<WS_PATH>` |
-| VMess gRPC | 10087 | tidak | serviceName `<WS_PATH>-grpc` |
 | VLESS WS | 10088 | tidak | path `/<WS_PATH>` |
-| VLESS gRPC | 10089 | tidak | serviceName `<WS_PATH>-grpc` |
-| VLESS Reality | 10090 | Reality | SNI `www.cloudflare.com` |
 | Trojan WS | 10091 | ya | path `/<WS_PATH>`, wajib domain+SSL |
-| Trojan gRPC | 10092 | ya | serviceName `<WS_PATH>-grpc`, wajib domain+SSL |
+
+> Transport yang dipakai **hanya WebSocket**. Port gRPC (10087/10089/10092) dan VLESS Reality (10090) tidak lagi dipakai, jadi tidak perlu dibuka di firewall.
 
 ## 1. SSH langsung (port 22)
 
@@ -36,14 +34,14 @@ CONNECT [host][port] HTTP/1.0[crlf][crlf]
 atau payload WebSocket standar:
 
 ```
-GET /<WS_PATH> HTTP/1.1[crlf]Host: DOMAIN[crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]
+GET / HTTP/1.1[crlf]Host: DOMAIN[crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]
 ```
 
 Pengaturan:
 - **Mode**: SSH over Websocket
 - **Host/Address**: `DOMAIN` (atau IP)
 - **Port**: `80` (ws) atau `443` (wss/SSL)
-- **Path**: `/<WS_PATH>`
+- **Path**: `/` (standar; path lain juga diterima / boleh dikosongkan)
 - **SSH target**: port 22 di belakang tunnel
 
 Setelah tunnel hidup, koneksi SSH berjalan di atasnya seperti SSH biasa.
@@ -71,8 +69,6 @@ vmess://<base64 dari JSON di bawah>
 }
 ```
 
-**VMess gRPC**: sama, tapi `"port": "10087"`, `"net": "grpc"`, `"path": "<WS_PATH>-grpc"`.
-
 Aplikasi: v2rayNG (Android), v2box / Shadowrocket / Streisand (iOS), v2rayN (Windows), V2RayXS (macOS). Import link atau isi manual.
 
 ## 4. VLESS
@@ -82,27 +78,11 @@ Aplikasi: v2rayNG (Android), v2box / Shadowrocket / Streisand (iOS), v2rayN (Win
 vless://UUID@DOMAIN:10088?path=%2F<WS_PATH>&security=none&encryption=none&type=ws#nama-akun
 ```
 
-**VLESS gRPC**:
-```
-vless://UUID@DOMAIN:10089?serviceName=<WS_PATH>-grpc&security=none&encryption=none&type=grpc#nama-akun
-```
-
-**VLESS Reality** (tanpa domain, anti-detect):
-```
-vless://UUID@DOMAIN:10090?security=reality&encryption=none&pbk=<PUBLIC_KEY>&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.cloudflare.com&sid=<SHORT_ID>#nama-akun-reality
-```
-`pbk` (public key) dan `sid` (short id) ditampilkan saat generate key (menu 5 → 8) dan disimpan di `/etc/sshwsxray`.
-
 ## 5. Trojan (wajib domain + SSL)
 
 **Trojan WS**:
 ```
 trojan://PASSWORD@DOMAIN:10091?path=%2F<WS_PATH>&security=tls&sni=DOMAIN&type=ws#nama-akun
-```
-
-**Trojan gRPC**:
-```
-trojan://PASSWORD@DOMAIN:10092?serviceName=<WS_PATH>-grpc&security=tls&sni=DOMAIN&type=grpc#nama-akun
 ```
 
 Aplikasi: sama dengan VMess/VLESS (semuanya mendukung trojan).
@@ -111,9 +91,9 @@ Aplikasi: sama dengan VMess/VLESS (semuanya mendukung trojan).
 
 | Gejala | Cek |
 |--------|-----|
-| SSH WS tidak konek | `systemctl status gost-websocket`; pastikan path persis `/<WS_PATH>` |
+| SSH WS tidak konek | `systemctl status sshws`; cek log `journalctl -u sshws -n 30`; SSH-WS tanpa path khusus, jadi pakai path `/` |
 | WSS gagal tapi WS jalan | cert SSL: `ls /etc/sshwsxray/cert/`; port 443 tidak keblokir ISP? |
 | Trojan hilang dari config | Trojan butuh cert SSL; tanpa cert inbound-nya di-skip otomatis |
-| Reality gagal handshake | `pbk`/`sid` harus persis dari server; coba `fp=firefox` |
 | Akun valid tapi tidak bisa internet | cek `journalctl -u xray -n 50`; cek IP limit/multi-login via menu monitoring |
-| Port ditolak | buka port di firewall/security group: `ufw allow 80,443,10086:10092/tcp` |
+| Port ditolak | buka port di firewall/security group: `ufw allow 80,443,10086,10088,10091/tcp` |
+| Config lama masih ada gRPC/Reality | menu 2 (Xray) → 9) Rebuild config + restart |

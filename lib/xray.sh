@@ -44,7 +44,7 @@ xray_safe_restart() {
 # Renders /usr/local/etc/xray/config.json from $XRAY_DB.
 # Inbound ports read from saved config so edits persist.
 xray_render_config() {
-    # pull latest settings (domain, cert dir, ports, reality short id)
+    # pull latest settings (domain, cert dir, ports)
     load_config
     apply_config_defaults
     local domain
@@ -55,52 +55,7 @@ xray_render_config() {
         cert="ok"
     fi
 
-    local vless_reality_inbound=""
-    local ws_grpc_inbounds=""
-
-    # --- VLESS Reality (no cert needed) ---
-    # reality.keys format: REALITY:<private_key>:<public_key>
-    local rkey rshort rpub
-    rkey=$(grep "^REALITY:" "$INSTALL_DIR/reality.keys" 2>/dev/null | cut -d: -f2)
-    rpub=$(grep "^REALITY:" "$INSTALL_DIR/reality.keys" 2>/dev/null | cut -d: -f3)
-    if [[ -n "$rkey" ]]; then
-        # reuse persisted shortId so existing client links stay valid
-        load_config
-        if [[ -n "${REALITY_SHORT_ID:-}" ]]; then
-            rshort="$REALITY_SHORT_ID"
-        else
-            rshort=$(head -c 16 /dev/urandom | base64 | tr -d '=+/' | head -c 8)
-        fi
-        [[ -n "$rpub" ]] && save_config REALITY_PUBLIC_KEY "$rpub"
-        vless_reality_inbound=$(cat <<EOF
-        {
-            "tag": "vless-reality-in",
-            "listen": "0.0.0.0",
-            "port": ${XRAY_VLESS_REALITY_PORT},
-            "protocol": "vless",
-            "settings": {
-                "clients": [],
-                "decryption": "none"
-            },
-            "streamSettings": {
-                "network": "tcp",
-                "security": "reality",
-                "realitySettings": {
-                    "show": false,
-                    "dest": "${REALITY_DEST}",
-                    "xver": 0,
-                    "serverNames": ["${REALITY_SERVER_NAMES}"],
-                    "privateKey": "${rkey}",
-                    "shortIds": ["${rshort}", ""]
-                }
-            },
-            "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"]}
-        }
-EOF
-)
-    fi
-
-    # --- WS / gRPC inbounds (need TLS cert for wss via direct TLS) ---
+    # --- WS inbounds (transport satu-satunya; TLS hanya untuk Trojan) ---
     local tls_block=""
     if [[ -n "$cert" ]]; then
         tls_block=$(cat <<EOF
@@ -117,12 +72,13 @@ EOF
     make_ws_inbound() {
         local tag="$1" port="$2" proto="$3"
         local security="none" tls_json=""
-        # ws is plain (behind gost wss in production) or direct TLS if cert exists
+        # WS harus listen 0.0.0.0 supaya klien dari luar bisa konek;
+        # TLS hanya untuk Trojan (butuh cert), protokol lain plain.
         [[ "$proto" == "trojan" ]] && security="tls" && tls_json="$tls_block"
         cat <<EOF
         {
             "tag": "${tag}",
-            "listen": "127.0.0.1",
+            "listen": "0.0.0.0",
             "port": ${port},
             "protocol": "${proto}",
             "settings": {
@@ -140,41 +96,15 @@ EOF
 EOF
     }
 
-    make_grpc_inbound() {
-        local tag="$1" port="$2" proto="$3"
-        local security="none" tls_json="{}"
-        [[ "$proto" == "trojan" ]] && security="tls" && tls_json="$tls_block"
-        cat <<EOF
-        {
-            "tag": "${tag}",
-            "listen": "0.0.0.0",
-            "port": ${port},
-            "protocol": "${proto}",
-            "settings": {
-                "clients": [],
-                "decryption": "none"
-            },
-            "streamSettings": {
-                "network": "grpc",
-                "security": "${security}",
-                "tlsSettings": ${tls_json},
-                "grpcSettings": {"serviceName": "${WS_PATH}-grpc"}
-            },
-            "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"]}
-        }
-EOF
-    }
-
     # Cert may be absent: Trojan requires TLS, so without cert we skip its
     # inbound instead of emitting invalid JSON ("tlsSettings": ,).
     if [[ -z "$cert" ]]; then
         print_warning "Cert SSL tidak ada - inbound Trojan dilewati (butuh TLS)"
     fi
-    local trojan_ws_json="" trojan_grpc_json=""
+    local trojan_ws_json=""
     if [[ -n "$cert" ]]; then
-        # leading comma because the previous inbound (vless-grpc) has none
-        trojan_ws_json=", $(make_ws_inbound "trojan-ws-in" "$XRAY_TROJAN_WS_PORT" "trojan"),"
-        trojan_grpc_json="$(make_grpc_inbound "trojan-grpc-in" "$XRAY_TROJAN_GRPC_PORT" "trojan")"
+        # leading comma: inbound sebelumnya (vless-ws) belum punya koma
+        trojan_ws_json=", $(make_ws_inbound "trojan-ws-in" "$XRAY_TROJAN_WS_PORT" "trojan")"
     fi
 
     # --- Collect clients per protocol ---
@@ -223,12 +153,8 @@ EOF
             "protocol": "dokodemo-door",
             "settings": {"address": "127.0.0.1"}
         },
-${vless_reality_inbound:+$vless_reality_inbound,}
 $(make_ws_inbound "vmess-ws-in" "$XRAY_VMESS_WS_PORT" "vmess"),
-$(make_ws_inbound "vless-ws-in" "$XRAY_VLESS_WS_PORT" "vless"),
-$(make_grpc_inbound "vmess-grpc-in" "$XRAY_VMESS_GRPC_PORT" "vmess"),
-$(make_grpc_inbound "vless-grpc-in" "$XRAY_VLESS_GRPC_PORT" "vless")
-${trojan_ws_json}${trojan_grpc_json}
+$(make_ws_inbound "vless-ws-in" "$XRAY_VLESS_WS_PORT" "vless")${trojan_ws_json}
     ],
     "outbounds": [
         {"tag": "direct", "protocol": "freedom"},
@@ -250,28 +176,10 @@ EOF
         python3 "${LIB_DIR}/xray_render.py" "$tag" "$clients" "$XRAY_CONFIG"
     }
 
-    inject_clients "vmess-ws-in"   "[${vmess_clients}]"
-    inject_clients "vmess-grpc-in" "[${vmess_clients}]"
-    inject_clients "vless-ws-in"   "[${vless_clients}]"
-    inject_clients "vless-grpc-in" "[${vless_clients}]"
-    inject_clients "vless-reality-in" "[${vless_clients}]"
+    inject_clients "vmess-ws-in"  "[${vmess_clients}]"
+    inject_clients "vless-ws-in"  "[${vless_clients}]"
     [[ -n "$trojan_clients_obj" ]] || trojan_clients_obj=''
-    inject_clients "trojan-ws-in"  "[${trojan_clients_obj}]"
-    inject_clients "trojan-grpc-in" "[${trojan_clients_obj}]"
-
-    # Reality shortId is per-render random; persist so links stay valid
-    if [[ -n "$rkey" ]]; then
-        local sid
-        sid=$(python3 -c "
-import json
-cfg = json.load(open('$XRAY_CONFIG'))
-for i in cfg['inbounds']:
-    if i.get('tag') == 'vless-reality-in':
-        print(i['streamSettings']['realitySettings']['shortIds'][0])
-        break
-")
-        [[ -n "$sid" ]] && save_config REALITY_SHORT_ID "$sid"
-    fi
+    inject_clients "trojan-ws-in" "[${trojan_clients_obj}]"
     return 0
 }
 
@@ -325,9 +233,7 @@ xray_show_status() {
     echo -e " Config    : $XRAY_CONFIG"
     echo ""
     echo -e "${CYAN}--- Port listener ---${NC}"
-    for p in "$XRAY_VMESS_WS_PORT" "$XRAY_VMESS_GRPC_PORT" "$XRAY_VLESS_WS_PORT" \
-             "$XRAY_VLESS_GRPC_PORT" "$XRAY_VLESS_REALITY_PORT" "$XRAY_TROJAN_WS_PORT" \
-             "$XRAY_TROJAN_GRPC_PORT"; do
+    for p in "$XRAY_VMESS_WS_PORT" "$XRAY_VLESS_WS_PORT" "$XRAY_TROJAN_WS_PORT"; do
         [[ -z "$p" ]] && continue
         if ss -tlnp 2>/dev/null | grep -q ":${p} "; then
             printf "  %-6s ${GREEN}LISTEN${NC}\n" "$p"
@@ -344,5 +250,15 @@ xray_restart_menu() {
     print_header
     echo -e "${CYAN}>>> RESTART XRAY${NC}"
     xray_safe_restart
+    pause_menu
+}
+
+# Render ulang config.json dari database lalu restart. Dipakai untuk
+# menerapkan perubahan skema/port tanpa perlu mengubah daftar akun.
+xray_rebuild_menu() {
+    print_header
+    echo -e "${CYAN}>>> REBUILD CONFIG XRAY${NC}"
+    echo ""
+    xray_render_config && xray_safe_restart
     pause_menu
 }

@@ -34,7 +34,7 @@ sysinfo() {
     echo -e " Xray      : $(xray_status) ($(command -v xray &>/dev/null && xray version | head -n1 | awk '{print $2}'))"
     echo ""
     echo -e "${CYAN}--- Banderole layanan ---${NC}"
-    for svc in ssh gost-websocket gost-websocket-tls xray cron; do
+    for svc in ssh sshws sshws-tls xray cron; do
         if systemctl is-active "$svc" &>/dev/null; then
             printf "  %-22s ${GREEN}RUNNING${NC}\n" "$svc"
         else
@@ -54,7 +54,7 @@ monitor_online() {
     echo ""
     echo -e "${CYAN}--- Koneksi ke port tunnel (WS/Xray) ---${NC}"
     local found=0
-    local ports="$GOST_PORT $GOST_TLS_PORT $XRAY_VMESS_WS_PORT $XRAY_VLESS_WS_PORT $XRAY_TROJAN_WS_PORT $XRAY_VLESS_REALITY_PORT"
+    local ports="$WS_PORT $WSS_PORT $XRAY_VMESS_WS_PORT $XRAY_VLESS_WS_PORT $XRAY_TROJAN_WS_PORT"
     for p in $ports; do
         [[ -z "$p" ]] && continue
         local count

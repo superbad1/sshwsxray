@@ -17,8 +17,6 @@ INSTALL_DIR="${SSHWSXRAY_INSTALL_DIR:-$INSTALL_DIR}"
 SSL_ONLY=0
 [[ "${1:-}" == "--ssl-only" ]] && SSL_ONLY=1
 
-GOST_VERSION="3.3.0"
-GOST_BASE_URL="https://github.com/go-gost/gost/releases/download/v${GOST_VERSION}"
 APP_DIR="/usr/local/lib/sshwsxray"
 
 log_step() { echo -e "\n${CYAN}==> ${1}${NC}"; }
@@ -78,36 +76,27 @@ EOF
     systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
 }
 
-# ---------- gost (SSH over WebSocket) ----------
-install_gost() {
-    log_step "Install gost v${GOST_VERSION} (SSH over WebSocket)"
-    local arch
-    arch=$(detect_arch)
-    local url="${GOST_BASE_URL}/gost_${GOST_VERSION}_linux_${arch}.tar.gz"
-    local tmp
-    tmp=$(mktemp -d)
-    wget -qO "$tmp/gost.tar.gz" "$url" || { print_error "Download gost gagal"; exit 1; }
-    tar -xzf "$tmp/gost.tar.gz" -C "$tmp"
-    install -m 755 "$tmp/gost" /usr/local/bin/gost
-    rm -rf "$tmp"
-    gost -V 2>&1 | head -n1 || true
-
-    # detect WS path & port (config may already exist on re-run)
+# ---------- Bridge WebSocket kustom (pure Python, pengganti gost) ----------
+install_sshws() {
+    log_step "Install bridge SSH-WebSocket (lib/sshws.py)"
     load_config
-    local ws_path="${WS_PATH:-wsxray}"
-    local ws_port="${GOST_PORT:-80}"
-    local wss_port="${GOST_TLS_PORT:-443}"
+    # SSH-WS memakai path standar '/' (tanpa path khusus); WS_PATH hanya untuk Xray
+    local ws_port="${WS_PORT:-80}"
+    local wss_port="${WSS_PORT:-443}"
 
-    # ---- plain websocket on port 80 -> forward to local sshd ----
-    # Format: forward+ws://:<listen>/<target>?path=<ws-path>
-    cat > /etc/systemd/system/gost-websocket.service <<EOF
+    # pastikan script bridge ada sebelum unit systemd dibuat
+    mkdir -p "$APP_DIR"
+    install -m 644 "${SCRIPT_DIR}/lib/sshws.py" "${APP_DIR}/sshws.py"
+
+    # ---- websocket biasa (port 80) -> sshd ----
+    cat > /etc/systemd/system/sshws.service <<EOF
 [Unit]
-Description=SSH over WebSocket (gost)
+Description=SSH over WebSocket (custom python bridge)
 After=network.target ssh.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/gost -L "forward+ws://:${ws_port}/127.0.0.1:22?path=${ws_path}"
+ExecStart=$(command -v python3) ${APP_DIR}/sshws.py --port ${ws_port} --target 127.0.0.1:22
 Restart=always
 RestartSec=3
 NoNewPrivileges=true
@@ -116,16 +105,16 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 EOF
 
-    # ---- websocket secure on 443 (needs cert) -> forward to sshd ----
+    # ---- websocket secure (port 443, butuh cert) -> sshd ----
     if [[ -f "${INSTALL_DIR}/cert/fullchain.pem" ]]; then
-        cat > /etc/systemd/system/gost-websocket-tls.service <<EOF
+        cat > /etc/systemd/system/sshws-tls.service <<EOF
 [Unit]
-Description=SSH over WSS (gost, TLS)
+Description=SSH over WSS (custom python bridge, TLS)
 After=network.target ssh.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/gost -L "forward+wss://:${wss_port}/127.0.0.1:22?path=${ws_path}&certFile=${INSTALL_DIR}/cert/fullchain.pem&keyFile=${INSTALL_DIR}/cert/privkey.pem"
+ExecStart=$(command -v python3) ${APP_DIR}/sshws.py --port ${wss_port} --target 127.0.0.1:22 --tls --cert ${INSTALL_DIR}/cert/fullchain.pem --key ${INSTALL_DIR}/cert/privkey.pem
 Restart=always
 RestartSec=3
 NoNewPrivileges=true
@@ -136,10 +125,10 @@ EOF
     fi
 
     systemctl daemon-reload
-    if [[ -f /etc/systemd/system/gost-websocket-tls.service ]]; then
-        systemctl enable gost-websocket gost-websocket-tls
+    if [[ -f /etc/systemd/system/sshws-tls.service ]]; then
+        systemctl enable sshws sshws-tls
     else
-        systemctl enable gost-websocket
+        systemctl enable sshws
     fi
 }
 
@@ -148,19 +137,6 @@ install_xray() {
     log_step "Install Xray-core (installer resmi XTLS/Xray-install)"
     bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
     systemctl enable xray
-
-    log_step "Generate key VLESS Reality"
-    local keys priv pub
-    keys=$(xray x25519 2>/dev/null)
-    priv=$(echo "$keys" | awk '/Private key/{print $3}')
-    pub=$(echo "$keys" | awk '/Public key/{print $3}')
-    if [[ -n "$priv" && -n "$pub" ]]; then
-        echo "REALITY:${priv}:${pub}" > "$INSTALL_DIR/reality.keys"
-        chmod 600 "$INSTALL_DIR/reality.keys"
-        print_success "Reality key: pub=${pub}"
-    else
-        print_warning "Gagal generate x25519 - inbound Reality dilewati"
-    fi
 }
 
 # ---------- SSL ----------
@@ -187,7 +163,7 @@ issue_ssl() {
 #!/bin/bash
 cp "/etc/letsencrypt/live/$domain/fullchain.pem" "$INSTALL_DIR/cert/"
 cp "/etc/letsencrypt/live/$domain/privkey.pem"  "$INSTALL_DIR/cert/"
-systemctl restart gost-websocket-tls xray 2>/dev/null
+systemctl restart sshws-tls xray 2>/dev/null
 EOF
         chmod +x /etc/letsencrypt/renewal-hooks/deploy/sshwsxray.sh
         return 0
@@ -295,16 +271,14 @@ if [[ -n "$DOMAIN_INPUT" ]]; then
     echo "$DOMAIN_INPUT" > "$INSTALL_DIR/domain"
 fi
 apply_config_defaults
-for key in WS_PATH GOST_PORT GOST_TLS_PORT XRAY_VMESS_WS_PORT XRAY_VMESS_GRPC_PORT \
-           XRAY_VLESS_WS_PORT XRAY_VLESS_GRPC_PORT XRAY_VLESS_REALITY_PORT \
-           XRAY_TROJAN_WS_PORT XRAY_TROJAN_GRPC_PORT XRAY_API_PORT \
-           REALITY_DEST REALITY_SERVER_NAMES IP_LIMIT TRIAL_HOURS; do
+for key in WS_PATH WS_PORT WSS_PORT XRAY_VMESS_WS_PORT XRAY_VLESS_WS_PORT \
+           XRAY_TROJAN_WS_PORT XRAY_API_PORT IP_LIMIT TRIAL_HOURS; do
     save_config "$key" "${!key}"
 done
 
 configure_ssh
-issue_ssl || true   # SSL dulu: unit gost TLS butuh cert
-install_gost
+issue_ssl || true   # SSL dulu: unit sshws-tls butuh cert
+install_sshws
 install_xray
 
 # sync cert into sshwsxray data dir if issued via letsencrypt path
@@ -322,8 +296,8 @@ fi
 source "${SCRIPT_DIR}/lib/xray.sh"
 xray_render_config
 xray_validate && systemctl restart xray
-systemctl restart gost-websocket 2>/dev/null
-systemctl restart gost-websocket-tls 2>/dev/null || true
+systemctl restart sshws 2>/dev/null
+systemctl restart sshws-tls 2>/dev/null || true
 
 install_app_files
 install_cron
@@ -344,17 +318,13 @@ echo -e " Domain    : ${local_domain:-(tanpa domain)}"
 echo -e " IP        : $(pubip)"
 echo -e ""
 echo -e " SSH       : port 22"
-echo -e " SSH WS    : ws://$(get_domain):${GOST_PORT}${WS_PATH}"
+echo -e " SSH WS    : ws://$(get_domain):${WS_PORT}/ (path standar /)"
 if [[ -f "$INSTALL_DIR/cert/fullchain.pem" ]]; then
-echo -e " SSH WSS   : wss://$(get_domain):${GOST_TLS_PORT}${WS_PATH}"
+echo -e " SSH WSS   : wss://$(get_domain):${WSS_PORT}/ (path standar /)"
 fi
 echo -e " VMess WS  : port ${XRAY_VMESS_WS_PORT} (path /${WS_PATH})"
-echo -e " VMess gRPC: port ${XRAY_VMESS_GRPC_PORT} (${WS_PATH}-grpc)"
 echo -e " VLESS WS  : port ${XRAY_VLESS_WS_PORT} (path /${WS_PATH})"
-echo -e " VLESS gRPC: port ${XRAY_VLESS_GRPC_PORT} (${WS_PATH}-grpc)"
-echo -e " VLESS RLTY: port ${XRAY_VLESS_REALITY_PORT} (${REALITY_SERVER_NAMES})"
 echo -e " Trojan WS : port ${XRAY_TROJAN_WS_PORT} (path /${WS_PATH}, TLS)"
-echo -e " Trojangrpc: port ${XRAY_TROJAN_GRPC_PORT} (${WS_PATH}-grpc, TLS)"
 echo -e ""
 echo -e " Jalankan menu : ${BOLD}sshwsxray${NC}"
 echo -e "${GREEN}==============================================${NC}"

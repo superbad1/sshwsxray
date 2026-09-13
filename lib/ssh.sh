@@ -59,8 +59,8 @@ ssh_create() {
         echo -e "${CYAN}----------------------------------------------${NC}"
         echo -e " Hostname : $(get_domain) ($(pubip))"
         echo -e " Port SSH : 22"
-        echo -e " Port WS  : ${GOST_PORT} (ws) / ${GOST_TLS_PORT} (wss)"
-        echo -e " Path WS  : ${WS_PATH}"
+        echo -e " Port WS  : ${WS_PORT} (ws) / ${WSS_PORT} (wss)"
+        echo -e " Path WS  : / (tanpa path)"
         echo -e " Username : ${user}"
         echo -e " Password : ${pass}"
         echo -e " Expired  : ${expire}"
@@ -73,8 +73,8 @@ ssh_create() {
 === AKUN SSH WEBSOCKET (${user}) ===
 Host      : ${domain:-$(pubip)}
 Port SSH  : 22
-Port WS   : ${GOST_PORT} (websocket) / ${GOST_TLS_PORT} (websocket secure)
-Path      : ${WS_PATH}
+Port WS   : ${WS_PORT} (websocket) / ${WSS_PORT} (websocket secure)
+Path      : / (tanpa path)
 User      : ${user}
 Password  : ${pass}
 Expired   : ${expire}

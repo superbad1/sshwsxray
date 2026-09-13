@@ -195,8 +195,6 @@ xray_user_show() {  # xray_user_show <proto> <user>
     domain=$(get_domain)
     local host="${domain:-$(pubip)}"
     local path="${WS_PATH}"
-    local sn
-    sn=$(echo "$REALITY_SERVER_NAMES" | awk '{print $1}')
 
     echo -e "${CYAN}----------------------------------------------${NC}"
     echo -e " ${BOLD}AKUN ${proto^^}: ${user}${NC}"
@@ -206,27 +204,18 @@ xray_user_show() {  # xray_user_show <proto> <user>
     echo -e "${CYAN}----------------------------------------------${NC}"
 
     if [[ "$proto" == "vmess" ]]; then
-        # vmess:// base64(JSON)
+        # vmess:// base64(JSON) — transport ws
         local json b64
         json=$(python3 -c "
 import json
 print(json.dumps({'v':'2','ps':'${user}-ws','add':'${host}','port':'${XRAY_VMESS_WS_PORT}','id':'${uuid}','aid':'0','scy':'auto','net':'ws','type':'none','host':'${host}','path':'/${path}','tls':''}, separators=(',',':')))
 ")
         b64=$(echo -n "$json" | base64 -w0)
-        echo -e " VMess WS   : vmess://${b64}"
-        json=$(python3 -c "
-import json
-print(json.dumps({'v':'2','ps':'${user}-grpc','add':'${host}','port':'${XRAY_VMESS_GRPC_PORT}','id':'${uuid}','aid':'0','scy':'auto','net':'grpc','type':'none','host':'${host}','path':'${path}-grpc','tls':''}, separators=(',',':')))
-")
-        b64=$(echo -n "$json" | base64 -w0)
-        echo -e " VMess gRPC : vmess://${b64}"
+        echo -e " VMess WS    : vmess://${b64}"
     elif [[ "$proto" == "vless" ]]; then
         echo -e " VLESS WS    : vless://${uuid}@${host}:${XRAY_VLESS_WS_PORT}?path=%2F${path}&security=none&encryption=none&type=ws#${user}-ws"
-        echo -e " VLESS gRPC  : vless://${uuid}@${host}:${XRAY_VLESS_GRPC_PORT}?serviceName=${path}-grpc&security=none&encryption=none&type=grpc#${user}-grpc"
-        echo -e " VLESS REAL  : vless://${uuid}@${host}:${XRAY_VLESS_REALITY_PORT}?security=reality&encryption=none&pbk=${REALITY_PUBLIC_KEY:-}&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=${sn}&sid=${REALITY_SHORT_ID:-}#${user}-reality"
     elif [[ "$proto" == "trojan" ]]; then
         echo -e " Trojan WS   : trojan://${uuid}@${host}:${XRAY_TROJAN_WS_PORT}?path=%2F${path}&security=tls&sni=${host}&type=ws#${user}-ws"
-        echo -e " Trojan gRPC : trojan://${uuid}@${host}:${XRAY_TROJAN_GRPC_PORT}?serviceName=${path}-grpc&security=tls&sni=${host}&type=grpc#${user}-grpc"
     fi
     echo -e "${CYAN}----------------------------------------------${NC}"
     return 0

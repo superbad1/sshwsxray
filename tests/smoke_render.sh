@@ -13,11 +13,13 @@ source "$PROJECT_ROOT/lib/common.sh"
 # minimal config: no domain, defaults
 apply_config_defaults
 mkdir -p "$INSTALL_DIR"
-echo "REALITY:fake-priv-key:fake-pub-key" > "$INSTALL_DIR/reality.keys"
 : > "$XRAY_DB"
 
 # shellcheck source=../lib/xray.sh
 source "$PROJECT_ROOT/lib/xray.sh"
+
+# transport yang TIDAK boleh ada lagi
+FORBIDDEN='("vless-reality-in", "vmess-grpc-in", "vless-grpc-in", "trojan-grpc-in")'
 
 # add fake clients to db (pipe-separated)
 echo "vmess|11111111-2222-3333-4444-555555555555|budi|2026-09-13|2026-10-13|2" >> "$XRAY_DB"
@@ -27,20 +29,31 @@ echo "trojan|trojanpass|cici|2026-09-13|2026-10-13|1" >> "$XRAY_DB"
 echo "=== Skenario 1: tanpa cert SSL ==="
 xray_render_config
 
-python3 - "$XRAY_CONFIG" <<'EOF'
+python3 - "$XRAY_CONFIG" <<EOF
 import json, sys
 cfg = json.load(open(sys.argv[1]))
 tags = [i["tag"] for i in cfg["inbounds"]]
-for t in ("api", "vless-reality-in", "vmess-ws-in", "vless-ws-in", "vmess-grpc-in", "vless-grpc-in"):
+for t in ("api", "vmess-ws-in", "vless-ws-in"):
     assert t in tags, (t, tags)
 assert "trojan-ws-in" not in tags, tags
+for t in $FORBIDDEN:
+    assert t not in tags, (t, tags)
+# transport WS harus bisa diakses dari luar (bukan loopback)
+for tag in ("vmess-ws-in", "vless-ws-in"):
+    ib = next(i for i in cfg["inbounds"] if i["tag"] == tag)
+    assert ib["listen"] == "0.0.0.0", (tag, ib["listen"])
+    assert ib["streamSettings"]["network"] == "ws", (tag, ib["streamSettings"]["network"])
+    assert ib["streamSettings"]["wsSettings"]["path"].startswith("/"), tag
+    assert "grpcSettings" not in ib["streamSettings"], tag
+# tidak ada sisa transport grpc/reality di config
+raw = open(sys.argv[1]).read()
+assert '"grpc"' not in raw, "masih ada transport grpc"
+assert "reality" not in raw, "masih ada reality"
+# API stats tetap localhost saja
+api = next(i for i in cfg["inbounds"] if i["tag"] == "api")
+assert api["listen"] == "127.0.0.1", api["listen"]
 vm = next(i for i in cfg["inbounds"] if i["tag"] == "vmess-ws-in")
 assert vm["settings"]["clients"] == [{"id": "11111111-2222-3333-4444-555555555555", "email": "11111111-2222-3333-4444-555555555555@vmess-ws-in"}]
-rl = next(i for i in cfg["inbounds"] if i["tag"] == "vless-reality-in")
-assert rl["streamSettings"]["realitySettings"]["privateKey"] == "fake-priv-key"
-assert rl["streamSettings"]["realitySettings"]["shortIds"], "shortId kosong"
-gr = next(i for i in cfg["inbounds"] if i["tag"] == "vless-grpc-in")
-assert gr["listen"] == "0.0.0.0", gr["listen"]
 print("RENDER (no cert) OK:", ", ".join(tags))
 EOF
 
@@ -52,16 +65,19 @@ save_config CERT_DIR "$INSTALL_DIR/cert"
 
 xray_render_config
 
-python3 - "$XRAY_CONFIG" <<'EOF'
+python3 - "$XRAY_CONFIG" <<EOF
 import json, sys
 cfg = json.load(open(sys.argv[1]))
 tags = [i["tag"] for i in cfg["inbounds"]]
-for t in ("trojan-ws-in", "trojan-grpc-in"):
-    assert t in tags, (t, tags)
+assert "trojan-ws-in" in tags, tags
+for t in $FORBIDDEN:
+    assert t not in tags, (t, tags)
 tr = next(i for i in cfg["inbounds"] if i["tag"] == "trojan-ws-in")
 assert tr["settings"]["clients"][0]["password"] == "trojanpass"
 assert tr["settings"]["clients"][0]["email"] == "trojanpass@trojan-ws-in"
 assert tr["streamSettings"]["security"] == "tls"
+assert tr["listen"] == "0.0.0.0", tr["listen"]
+assert tr["streamSettings"]["network"] == "ws", tr["streamSettings"]["network"]
 print("RENDER (with cert) OK:", ", ".join(tags))
 EOF
 

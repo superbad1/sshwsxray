@@ -70,6 +70,7 @@ menu_xray() {
         echo -e "  6) Detail & link akun"
         echo -e "  7) Status service xray"
         echo -e "  8) Restart xray"
+        echo -e "  9) Rebuild config + restart"
         echo -e "  x) Kembali"
         echo ""
         read -rp "Pilih menu: " choice
@@ -82,6 +83,7 @@ menu_xray() {
             6) xray_user_show_menu ;;
             7) xray_show_status ;;
             8) xray_restart_menu ;;
+            9) xray_rebuild_menu ;;
             x|X) return 0 ;;
             *) print_warning "Pilihan tidak valid"; sleep 1 ;;
         esac
@@ -139,21 +141,22 @@ menu_settings() {
         echo ""
         load_config
         echo -e "  Domain           : ${DOMAIN:-belum diset}"
-        echo -e "  Path WS          : /${WS_PATH}"
+        echo -e "  Path SSH-WS      : / (standar, tanpa path)"
+        echo -e "  Path Xray WS     : /${WS_PATH}"
+        echo -e "  Transport Xray   : WebSocket (ws) saja"
         echo -e "  Batas IP default : ${IP_LIMIT}"
         echo -e "  Trial (jam)      : ${TRIAL_HOURS}"
         echo -e "  Auto reboot      : ${AUTO_REBOOT} (1=aktif 05:00)"
         echo -e "  Telegram         : $([[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]] && echo terkonfigurasi || echo belum)"
         echo ""
         echo -e "  1) Set domain"
-        echo -e "  2) Set path WebSocket"
+        echo -e "  2) Set path WebSocket (Xray)"
         echo -e "  3) Set batas IP default"
         echo -e "  4) Set durasi trial (jam)"
         echo -e "  5) Toggle auto reboot"
         echo -e "  6) Konfigurasi Telegram bot"
         echo -e "  7) Test notifikasi Telegram"
-        echo -e "  8) Regenerate key VLESS Reality"
-        echo -e "  9) Install / perbarui sertifikat SSL"
+        echo -e "  8) Install / perbarui sertifikat SSL"
         echo -e "  x) Kembali"
         echo ""
         read -rp "Pilih menu: " choice
@@ -169,9 +172,9 @@ menu_settings() {
                 fi
                 pause_menu ;;
             2)
-                read -rp "Path (tanpa slash depan): " p
+                read -rp "Path Xray WS (tanpa slash depan): " p
                 p="${p#/}"
-                [[ -n "$p" ]] && { save_config WS_PATH "$p"; print_success "Path WS: /$p"; }
+                [[ -n "$p" ]] && { save_config WS_PATH "$p"; print_success "Path Xray WS: /$p"; }
                 xray_render_config && xray_safe_restart
                 pause_menu ;;
             3)
@@ -202,24 +205,6 @@ menu_settings() {
                 fi
                 pause_menu ;;
             8)
-                if command -v xray &>/dev/null; then
-                    local_keys=$(xray x25519 2>/dev/null)
-                    priv=$(echo "$local_keys" | awk '/Private key/{print $3}')
-                    pub=$(echo "$local_keys" | awk '/Public key/{print $3}')
-                    if [[ -n "$priv" && -n "$pub" ]]; then
-                        echo "REALITY:${priv}:${pub}" > "$INSTALL_DIR/reality.keys"
-                        chmod 600 "$INSTALL_DIR/reality.keys"
-                        save_config REALITY_SHORT_ID ""
-                        xray_render_config && xray_safe_restart
-                        print_success "Key Reality baru: pub=${pub}"
-                    else
-                        print_error "Gagal generate x25519 (xray terlalu tua?)"
-                    fi
-                else
-                    print_error "xray binary tidak ditemukan"
-                fi
-                pause_menu ;;
-            9)
                 "$SCRIPT_DIR/setup.sh" --ssl-only
                 pause_menu ;;
             x|X) return 0 ;;
