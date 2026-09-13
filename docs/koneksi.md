@@ -119,7 +119,7 @@ Aplikasi: sama dengan VMess/VLESS (semuanya mendukung trojan).
 | WSS gagal tapi WS jalan | cert SSL: `ls /etc/sshwsxray/cert/`; port 443 tidak keblokir ISP? |
 | Trojan hilang dari config | Trojan butuh cert SSL; tanpa cert inbound-nya di-skip otomatis |
 | Akun valid tapi tidak bisa internet | cek `journalctl -u xray -n 50`; cek IP limit/multi-login via menu monitoring |
-| Port ditolak | installer otomatis membuka port di `ufw` bila aktif; kalau tidak, buka manual: `ufw allow 80,443,10086,10088,10091/tcp` |
+| Port ditolak | installer **tidak mengubah firewall**; buka sendiri di security group VPS atau firewall-mu, mis. `ufw allow 80,443,10086,10088,10091/tcp` |
 | Sudah konek lalu diputus terus | batas IP akun SSH terlewati (hitung IP unik dari sesi sshd); cek `IP_LIMIT` di `/etc/sshwsxray/config` atau menu 5 → 3 |
 | Koneksi SSH-WS ditolak random | `WS_MAX_PER_IP` (default 16) membatasi koneksi bersamaan per IP; naikkan atau set `0` di `/etc/sshwsxray/config` |
 | Config lama masih ada gRPC/Reality | menu 2 (Xray) → 9) Rebuild config + restart |

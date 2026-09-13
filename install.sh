@@ -221,22 +221,15 @@ EOF
     return 0
 }
 
-# Tidak memaksa firewall apa pun; kalau ufw terpasang & aktif, port yang
-# dibutuhkan dibuka otomatis supaya tidak "sudah terpasang tapi ditolak".
-configure_firewall() {
+# Script ini TIDAK menyentuh firewall apa pun - tidak memasang, tidak
+# mengaktifkan, dan tidak menambah aturan. Fungsi ini murni memberi tahu port
+# mana yang harus dibuka sendiri (security group VPS, iptables, nftables, dsb).
+# Tidak ada satu pun perintah firewall yang dijalankan dari script ini.
+notice_firewall_ports() {
     log_step "Firewall"
     local ports=("22" "${WS_PORT:-80}" "${WSS_PORT:-443}" "${XRAY_VMESS_WS_PORT}" "${XRAY_VLESS_WS_PORT}" "${XRAY_TROJAN_WS_PORT}")
-    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "^Status: active"; then
-        local p
-        for p in "${ports[@]}"; do
-            [[ -z "$p" ]] && continue
-            ufw allow "$p"/tcp >/dev/null 2>&1
-        done
-        print_success "Port dibuka di ufw: ${ports[*]} (tcp)"
-        return 0
-    fi
-    print_warning "ufw tidak aktif - pastikan port berikut terbuka di firewall/security group VPS:"
-    print_warning "  ${ports[*]} (tcp)"
+    print_warning "Script ini tidak mengubah firewall. Pastikan port berikut terbuka:"
+    print_warning "  ${ports[*]} (tcp) - lewat security group VPS atau firewall pilihanmu"
     return 0
 }
 
@@ -451,7 +444,7 @@ install_all() {
     # service yang gagal start (mis. port 80 dipakai web server lain) tidak
     # boleh menggagalkan pemasangan menu, cron, dan symlink.
 
-    configure_firewall || true
+    notice_firewall_ports || true
 
     install_app_files
     install_cron || true
@@ -509,9 +502,8 @@ ssl_only() {
         print_error "SSL gagal - tidak ada perubahan yang diterapkan"
         return 1
     fi
-    # port 443 baru mulai dipakai sekarang: pastikan tidak ditolak firewall
-    # (kalau ufw aktif) - sama seperti saat instalasi penuh
-    configure_firewall || true
+    # port 443 baru mulai dipakai sekarang: ingatkan lagi port yang perlu dibuka
+    notice_firewall_ports || true
     install_app_files
     # shellcheck source=lib/xray.sh
     source "${SCRIPT_DIR}/lib/xray.sh"

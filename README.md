@@ -179,9 +179,11 @@ Semua port dapat diubah di `/etc/sshwsxray/config` lalu restart service.
 Mengganti path dilakukan lewat **menu 5 → 2** (path baru dibuat acak, config
 Xray dirender ulang, unit bridge ditulis ulang, lalu kedua service di-restart).
 
-Kalau `ufw` terpasang & aktif, installer membuka port-port di atas otomatis.
-Kalau tidak, pastikan port tersebut terbuka di firewall/security group VPS
-(pesan peringatan akan ditampilkan di akhir instalasi).
+Installer **tidak menyentuh firewall sama sekali** — tidak memasang, tidak
+mengaktifkan, dan tidak menambah aturan apa pun pada `ufw`, `iptables`, maupun
+`nftables`. Firewall sepenuhnya urusanmu: pastikan port di atas terbuka lewat
+security group VPS atau firewall pilihanmu. Daftar port yang perlu dibuka
+ditampilkan sebagai peringatan di akhir instalasi.
 
 `WS_MAX_PER_IP` (default `16`) membatasi jumlah koneksi SSH-WebSocket
 bersamaan dari satu alamat IP; isi `0` untuk mematikannya. Koneksi Xray lewat

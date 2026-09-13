@@ -73,7 +73,7 @@ check "install_app_files: install.sh executable" "$([[ -x "$APP_DIR/install.sh" 
 
 # ---------- T1b: unit systemd memakai path APP_DIR yang benar ----------
 check "bridge_write_units terdefinisi (lib/bridge.sh)" "$(declare -F bridge_write_units >/dev/null && echo ya)" "ya"
-check "configure_firewall terdefinisi" "$(declare -F configure_firewall >/dev/null && echo ya)" "ya"
+check "notice_firewall_ports terdefinisi" "$(declare -F notice_firewall_ports >/dev/null && echo ya)" "ya"
 check "check_port_free terdefinisi" "$(declare -F check_port_free >/dev/null && echo ya)" "ya"
 
 # ---------- K2: tidak boleh ada download script pihak ketiga ----------
@@ -229,6 +229,22 @@ check "config: BIN_DIR mengikuti SSHWSXRAY_BIN_DIR" \
     "$(SSHWSXRAY_BIN_DIR=/opt/ujicoba bash -c "source '$PROJECT_ROOT/lib/common.sh' >/dev/null 2>&1; echo \$BIN_DIR")" "/opt/ujicoba"
 check "uninstall menghapus symlink menu" \
     "$(grep -c 'rm -f /usr/local/bin/sshwsxray /usr/local/bin/menu' "$PROJECT_ROOT/uninstall.sh")" "1"
+
+# ---------- K11: script tidak boleh menyentuh firewall ----------
+# Baik memasang, mengaktifkan, membaca status, maupun menambah aturan. Jadi
+# kata 'ufw' pun tidak boleh muncul di berkas yang dijalankan.
+ufw_hits=$(grep -rniE '\bufw\b' \
+    "$PROJECT_ROOT/install.sh" "$PROJECT_ROOT/menu.sh" "$PROJECT_ROOT/uninstall.sh" \
+    "$PROJECT_ROOT/lib" 2>/dev/null | wc -l)
+check "tidak ada referensi ufw di script mana pun" "$ufw_hits" "0"
+firewall_cmds=$(grep -rnE '(^|[[:space:];&|])(sudo[[:space:]]+)?(ufw|firewall-cmd|iptables|nft)[[:space:]]' \
+    "$PROJECT_ROOT/install.sh" "$PROJECT_ROOT/menu.sh" "$PROJECT_ROOT/uninstall.sh" \
+    "$PROJECT_ROOT/lib" 2>/dev/null | wc -l)
+check "tidak ada perintah firewall yang dijalankan" "$firewall_cmds" "0"
+check "installer memberi tahu port yang perlu dibuka" \
+    "$(grep -c 'Script ini tidak mengubah firewall' "$PROJECT_ROOT/install.sh")" "1"
+check "notify port dipanggil di instalasi penuh dan mode SSL" \
+    "$(grep -c 'notice_firewall_ports || true' "$PROJECT_ROOT/install.sh")" "2"
 
 echo
 if (( failures == 0 )); then
