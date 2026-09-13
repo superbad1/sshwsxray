@@ -53,18 +53,40 @@ tg_send_file() {  # tg_send_file <file> [caption]
     [[ "$code" == "200" ]]
 }
 
-# Isi arsip backup. /etc/shadow sengaja TIDAK diikutkan (hash password) dan
-# ekstraksi saat restore juga tidak menyentuh file sistem (lihat tg_restore).
-_tg_archive_create() {  # _tg_archive_create <path>
-    local file="$1"
-    tar -czf "$file" \
-        /etc/sshwsxray \
-        /etc/passwd /etc/group \
-        /etc/letsencrypt 2>/dev/null
+# Anggota arsip backup, ditulis sebagai path RELATIF terhadap root.
+# /etc/shadow sengaja TIDAK diikutkan (hash password).
+_backup_members() {
+    printf '%s\n' etc/sshwsxray etc/passwd etc/group etc/letsencrypt
     if [[ -f "$XRAY_CONFIG" ]]; then
-        tar -rzf "$file" -C / usr/local/etc/xray/config.json 2>/dev/null
+        printf '%s\n' usr/local/etc/xray/config.json
     fi
+    return 0
+}
+
+# Isi arsip backup.
+#
+# SATU panggilan tar saja: `tar -r` TIDAK bisa menambahkan isi ke arsip
+# terkompresi (GNU tar: "Cannot update compressed archives"), dan itulah yang
+# dulu membuat config Xray tidak pernah ikut ter-backup - gagalnya senyap
+# karena stderr dibuang.
+_tg_archive_create() {  # _tg_archive_create <path> [root]
+    local file="$1" root="${2:-/}" m rc=0
+    local -a members=() present=()
+
+    while IFS= read -r m; do
+        [[ -z "$m" ]] && continue
+        members+=("$m")
+    done < <(_backup_members)
+
+    for m in "${members[@]}"; do
+        [[ -e "${root}/${m}" ]] && present+=("$m")
+    done
+    (( ${#present[@]} > 0 )) || return 1
+
+    tar -czf "$file" -C "$root" "${present[@]}" 2>/dev/null || rc=1
+    (( rc == 0 )) || { rm -f "$file"; return 1; }
     chmod 600 "$file" 2>/dev/null
+    return 0
 }
 
 # Full backup -> tarball -> send to Telegram
@@ -85,8 +107,17 @@ tg_backup() {
     file="${backup_dir}/backup-${hostname}-${stamp}.tar.gz"
 
     print_info "Membuat arsip backup..."
-    _tg_archive_create "$file"
-    [[ -s "$file" ]] || { print_error "Arsip backup kosong/gagal dibuat"; return 1; }
+    if ! _tg_archive_create "$file" || [[ ! -s "$file" ]]; then
+        print_error "Arsip backup kosong/gagal dibuat"
+        rm -f "$file"
+        return 1
+    fi
+    # pastikan data akun benar-benar ada di dalam arsip sebelum dikirim
+    if ! tar -tzf "$file" 2>/dev/null | grep -q 'etc/sshwsxray'; then
+        print_error "Arsip tidak memuat data akun - backup dibatalkan"
+        rm -f "$file"
+        return 1
+    fi
 
     print_info "Mengirim ke Telegram..."
     if tg_send_file "$file" "Backup ${hostname} (${ip}) ${stamp}"; then
@@ -115,7 +146,9 @@ tg_restore() {  # tg_restore <backup.tar.gz>
     local safe="/root/backup/pre-restore-$(date +%Y%m%d-%H%M%S).tar.gz"
     mkdir -p /root/backup
     chmod 700 /root/backup 2>/dev/null
-    tar -czf "$safe" -C / etc/sshwsxray 2>/dev/null && print_info "Snapshot data lama: $safe"
+    if tar -czf "$safe" -C / etc/sshwsxray 2>/dev/null; then
+        print_info "Snapshot data lama: $safe"
+    fi
 
     local members="etc/sshwsxray"
     if tar -tzf "$file" 2>/dev/null | grep -qx 'usr/local/etc/xray/config.json'; then

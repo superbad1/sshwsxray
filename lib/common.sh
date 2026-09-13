@@ -17,12 +17,19 @@ NC='\033[0m'
 # ---------- Constants ----------
 INSTALL_DIR="${SSHWSXRAY_INSTALL_DIR:-/etc/sshwsxray}"
 BIN_DIR="/usr/local/bin"
+# Direktori aplikasi hasil instalasi (install.sh, menu.sh, lib/, sshws.py).
+# Dipakai installer, menu, dan lib/bridge.sh - jadi didefinisikan di sini.
+APP_DIR="${SSHWSXRAY_APP_DIR:-/usr/local/lib/sshwsxray}"
 # Directory holding lib/*.py helpers (callers set SCRIPT_DIR before sourcing)
 LIB_DIR="${SCRIPT_DIR:-/usr/local/lib/sshwsxray}/lib"
 CONFIG_FILE="$INSTALL_DIR/config"
 XRAY_CONFIG="${SSHWSXRAY_XRAY_CONFIG:-/usr/local/etc/xray/config.json}"
 XRAY_DB="$INSTALL_DIR/xray_users.db"
 XRAY_TRAFFIC_DB="$INSTALL_DIR/xray_traffic.db"
+# Peta 'port|ip' yang ditulis bridge (lib/sshws.py --peer-map). Dipakai monitor
+# untuk mengembalikan IP asli klien WebSocket, yang di sisi sshd tampak sebagai
+# 127.0.0.1 (bridge meneruskan ke sshd lewat loopback).
+WS_PEER_MAP="$INSTALL_DIR/ws_peers.db"
 
 # ---------- UI helpers ----------
 print_header() {
@@ -104,11 +111,20 @@ load_config() {
 apply_config_defaults() {
     DOMAIN="${DOMAIN:-}"
     CERT_DIR="${CERT_DIR:-}"
-    WS_PATH="${WS_PATH:-wsxray}"
     WS_PORT="${WS_PORT:-80}"
     WSS_PORT="${WSS_PORT:-443}"
     # batas koneksi bersamaan per-IP untuk bridge SSH-WebSocket
     WS_MAX_PER_IP="${WS_MAX_PER_IP:-16}"
+    # Path Xray per protokol. Diisi token acak oleh xray_ws_paths_ensure()
+    # (lib/xray.sh) supaya VMess/VLESS/Trojan bisa dibedakan saat semuanya
+    # lewat port 80/443 yang sama dengan SSH-WebSocket.
+    XRAY_VMESS_WS_PATH="${XRAY_VMESS_WS_PATH:-}"
+    XRAY_VLESS_WS_PATH="${XRAY_VLESS_WS_PATH:-}"
+    XRAY_TROJAN_WS_PATH="${XRAY_TROJAN_WS_PATH:-}"
+    # inbound Trojan tambahan khusus untuk bridge 443: bridge yang menerima
+    # TLS, jadi inbound ini polos (security none) dan hanya listen di loopback
+    XRAY_TROJAN_MUX_PORT="${XRAY_TROJAN_MUX_PORT:-10093}"
+    is_int "$XRAY_TROJAN_MUX_PORT" || XRAY_TROJAN_MUX_PORT=10093
     # Hanya transport WebSocket yang dipakai (gRPC & Reality dihapus)
     XRAY_VMESS_WS_PORT="${XRAY_VMESS_WS_PORT:-10086}"
     XRAY_VLESS_WS_PORT="${XRAY_VLESS_WS_PORT:-10088}"
@@ -202,6 +218,14 @@ days_left() {
 is_int() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
 
 # ---------- Random generators ----------
+# (WS_PATH lama sudah tidak dipakai: path Xray sekarang acak per protokol,
+#  lihat XRAY_*_WS_PATH di atas dan xray_ws_paths_ensure di lib/xray.sh)
+# Token path acak (huruf kecil + angka), dipakai Xray sebagai path WebSocket.
+gen_token() {  # gen_token [panjang]  (default 12)
+    local len="${1:-12}"
+    LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c "$len"
+}
+
 gen_uuid() {
     local uuid=""
     uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null) || uuid=$(uuidgen 2>/dev/null) || true
@@ -240,7 +264,7 @@ ensure_db_files() {
     mkdir -p "$INSTALL_DIR"
     chmod 700 "$INSTALL_DIR" 2>/dev/null
     local f
-    for f in ssh_users.db xray_users.db xray_traffic.db trial_users.db; do
+    for f in ssh_users.db xray_users.db xray_traffic.db trial_users.db ws_peers.db; do
         [[ -f "$INSTALL_DIR/$f" ]] || : > "$INSTALL_DIR/$f"
         chmod 600 "$INSTALL_DIR/$f" 2>/dev/null
     done

@@ -80,6 +80,27 @@ for lib in common telegram ssh xray monitor; do
     fi
 done
 
+# ---------- peta IP asli klien WebSocket ----------
+# Semua koneksi lewat bridge tampak dari 127.0.0.1 di sisi sshd, sehingga tanpa
+# peta port->ip dari bridge, limit IP per akun tidak pernah tercapai.
+echo "40000|203.0.113.9" > "$WS_PEER_MAP"
+check "peer map: IP asli dikembalikan" "$(_real_ip_for_peer 127.0.0.1 40000)" "203.0.113.9"
+check "peer map: IP publik dibiarkan apa adanya" "$(_real_ip_for_peer 203.0.113.5 40001)" "203.0.113.5"
+check "peer map: port tak dikenal tetap loopback" "$(_real_ip_for_peer 127.0.0.1 41000)" "127.0.0.1"
+check "_peer_port dari ip:port" "$(_peer_port "127.0.0.1:40000")" "40000"
+check "_peer_port dari [ipv6]:port" "$(_peer_port "[::1]:40000")" "40000"
+rm -f "$WS_PEER_MAP"
+
+# cron harus benar-benar menjalankan apa yang diklaim header-nya
+for job in monitor_enforce xray_traffic_update; do
+    if echo "$CRON_BODY" | grep -qE "^[[:space:]]*${job}([[:space:]]|$)"; then
+        echo "PASS  cron menjalankan ${job}"
+    else
+        echo "FAIL  cron tidak menjalankan ${job}"
+        failures=$((failures + 1))
+    fi
+done
+
 echo
 if (( failures == 0 )); then
     echo "ALL WIRING TESTS PASSED"

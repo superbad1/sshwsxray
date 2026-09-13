@@ -17,9 +17,17 @@ Path: standar `/` — TIDAK ada path khusus untuk SSH-WS, jadi berapa pun
 path yang diminta klien tetap diterima (maksimal kompatibel dengan injector).
 Bila `--path` diisi selain `/`, pencocokan path ditegakkan lagi (404 bila beda).
 
+Router Xray: port 80/443 dipakai bersama SSH-WebSocket dan Xray, jadi bridge
+ini juga bisa menjadi router berbasis path (seperti nginx). Setiap `--route
+/path=host:port` mengarahkan path tertentu ke inbound Xray; request upgrade
+diteruskan APA ADANYA sehingga Xray sendiri yang menjawab 101. Path yang tidak
+cocok dengan route mana pun tetap dilayani sebagai SSH.
+
 Usage:
     sshws.py --port 80  --target 127.0.0.1:22
     sshws.py --port 443 --target 127.0.0.1:22 \
+             --route /vmTOKEN=127.0.0.1:10086 \
+             --route /vlTOKEN=127.0.0.1:10088 \
              --tls --cert /etc/sshwsxray/cert/fullchain.pem \
                   --key  /etc/sshwsxray/cert/privkey.pem
 
@@ -108,6 +116,62 @@ def peer_ip(peer) -> str:
     return "unknown"
 
 
+class PeerMap:
+    """Peta `port loopback bridge -> IP klien asli`, satu baris `port|ip`.
+
+    Bridge menyambung ke sshd dari 127.0.0.1, jadi sshd - dan `ss` yang dipakai
+    cron/monitor - melihat SEMUA klien WebSocket seolah datang dari loopback.
+    Akibatnya limit IP per akun (yang dihitung dari IP unik di port 22) tidak
+    pernah tercapai untuk pengguna WS, padahal itulah jalur utamanya. File ini
+    membuat cron bisa mengembalikan IP asli klien.
+
+    Sejak Python 3.3, open() memakai O_CLOEXEC; asyncio loop tunggal, jadi
+    penulisan ulang file ini tidak butuh penguncian.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.entries: dict[int, str] = {}
+        self.enabled = True
+        # mulai dari bersih: sisakan entri basi dari proses sebelumnya
+        self._flush()
+
+    def register(self, writer: asyncio.StreamWriter, ip: str) -> Optional[int]:
+        if not self.enabled:
+            return None
+        sockname = writer.get_extra_info("sockname")
+        if not sockname or len(sockname) < 2:
+            return None
+        port = int(sockname[1])
+        self.entries[port] = ip
+        self._flush()
+        return port
+
+    def unregister(self, port: int) -> None:
+        if self.entries.pop(port, None) is not None:
+            self._flush()
+
+    def _flush(self) -> None:
+        tmp = "%s.tmp.%d" % (self.path, os.getpid())
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                for port, ip in sorted(self.entries.items()):
+                    fh.write("%d|%s\n" % (port, ip))
+            os.replace(tmp, self.path)
+            os.chmod(self.path, 0o600)
+        except OSError as exc:
+            log.warning(
+                "tidak bisa menulis peer map %s (%s) - limit IP jalur WS dimatikan",
+                self.path,
+                exc,
+            )
+            self.enabled = False
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
 def tune(sock: Optional[socket.socket]) -> None:
     """Low latency matters for interactive SSH."""
     if sock is None:
@@ -140,6 +204,49 @@ async def pump(src: asyncio.StreamReader, dst: asyncio.StreamWriter) -> None:
 # --------------------------------------------------------------------------
 # Per-connection handling
 # --------------------------------------------------------------------------
+async def connect_backend(
+    host: str, port: int, timeout: float
+) -> Tuple[Optional[asyncio.StreamReader], Optional[asyncio.StreamWriter]]:
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout
+        )
+    except (OSError, asyncio.TimeoutError) as exc:
+        log.error("gagal konek ke %s:%s (%s)", host, port, exc)
+        return None, None
+    tune(writer.get_extra_info("socket"))
+    return reader, writer
+
+
+async def relay(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    target_reader: asyncio.StreamReader,
+    target_writer: asyncio.StreamWriter,
+) -> None:
+    """Salurkan byte dua arah apa adanya sampai salah satu sisi selesai."""
+    upstream = asyncio.create_task(pump(reader, target_writer))
+    downstream = asyncio.create_task(pump(target_reader, writer))
+    done, pending = await asyncio.wait(
+        {upstream, downstream}, return_when=asyncio.FIRST_COMPLETED
+    )
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+    for task in done:
+        exc = task.exception()
+        if exc and not isinstance(
+            exc,
+            (
+                ConnectionResetError,
+                ConnectionAbortedError,
+                BrokenPipeError,
+                asyncio.IncompleteReadError,
+            ),
+        ):
+            log.debug("task berhenti dengan error: %r", exc)
+
+
 async def handle_client(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
@@ -148,6 +255,7 @@ async def handle_client(
     peer = writer.get_extra_info("peername")
     tune(writer.get_extra_info("socket"))
     target_writer: Optional[asyncio.StreamWriter] = None
+    registered_port: Optional[int] = None
     try:
         raw = await read_request(reader, args.handshake_timeout)
         if raw is None:
@@ -155,12 +263,34 @@ async def handle_client(
             return
 
         method, path, headers = parse_request(raw)
+        req_path = normalize_path(path)
+
+        # ---- Mode router: path cocok dengan --route -> teruskan ke backend ----
+        # Dipakai Xray: request diteruskan APA ADANYA (tanpa satu byte pun
+        # dibuang) sehingga backend itu sendiri yang menjawab 101, dan byte
+        # yang sudah dipipelkan klien tetap utuh.
+        route = args.routes.get(req_path)
+        if route is not None:
+            target_reader, target_writer = await connect_backend(
+                route[0], route[1], args.connect_timeout
+            )
+            if target_writer is None:
+                http_error(writer, 502, "Bad Gateway")
+                await writer.drain()
+                return
+            target_writer.write(raw)
+            await target_writer.drain()
+            log.info("route %s -> %s:%s dari %s", req_path, route[0], route[1], peer)
+            await relay(reader, writer, target_reader, target_writer)
+            return
+
+        # ---- Mode SSH: bridge balas 101 sendiri lalu pipe ke sshd ----
         want = normalize_path(args.path)
         upgrade = headers.get("upgrade", "").lower()
         connection = headers.get("connection", "").lower()
 
         # Standar '/': tanpa path khusus, semua path diterima.
-        if want != "/" and normalize_path(path) != want:
+        if want != "/" and req_path != want:
             log.info("path tidak cocok (%s) dari %s", path, peer)
             http_error(writer, 404, "Not Found")
             await writer.drain()
@@ -176,64 +306,67 @@ async def handle_client(
             await writer.drain()
             return
 
-        # Balas 101 Switching Protocols. Sec-WebSocket-Accept hanya dikirim
-        # bila klien menyertakan key (sebagian injector tidak menyertakannya).
-        response = [
-            "HTTP/1.1 101 Switching Protocols",
-            "Upgrade: websocket",
-            "Connection: Upgrade",
-        ]
-        key = headers.get("sec-websocket-key")
-        if key:
-            response.append("Sec-WebSocket-Accept: %s" % make_accept(key))
-        writer.write(("\r\n".join(response) + "\r\n\r\n").encode())
-        await writer.drain()
+        # Batas per-IP hanya untuk jalur SSH: satu klien Xray bisa membuka
+        # puluhan koneksi sah, jadi tidak boleh dihitung dengan limit akun SSH.
+        ip = peer_ip(peer)
+        limited = args.max_per_ip > 0
+        if limited:
+            if args.per_ip.get(ip, 0) >= args.max_per_ip:
+                log.warning("batas %d koneksi per IP tercapai (%s)", args.max_per_ip, ip)
+                writer.close()
+                return
+            args.per_ip[ip] = args.per_ip.get(ip, 0) + 1
 
         try:
-            target_reader, target_writer = await asyncio.wait_for(
-                asyncio.open_connection(args.target_host, args.target_port),
-                args.connect_timeout,
+            # Balas 101 Switching Protocols. Sec-WebSocket-Accept hanya
+            # dikirim bila klien menyertakan key (sebagian injector tidak).
+            response = [
+                "HTTP/1.1 101 Switching Protocols",
+                "Upgrade: websocket",
+                "Connection: Upgrade",
+            ]
+            key = headers.get("sec-websocket-key")
+            if key:
+                response.append("Sec-WebSocket-Accept: %s" % make_accept(key))
+            writer.write(("\r\n".join(response) + "\r\n\r\n").encode())
+            await writer.drain()
+
+            target_reader, target_writer = await connect_backend(
+                args.target_host, args.target_port, args.connect_timeout
             )
-        except (OSError, asyncio.TimeoutError) as exc:
-            log.error("gagal konek ke %s:%s (%s)", args.target_host, args.target_port, exc)
-            return
+            if target_writer is None:
+                return
 
-        tune(target_writer.get_extra_info("socket"))
-        log.info(
-            "bridge aktif: %s -> %s:%s (request %s)",
-            peer,
-            args.target_host,
-            args.target_port,
-            path or "/",
-        )
+            # catat IP asli klien untuk port loopback ini, supaya cron bisa
+            # menghitung jumlah IP unik per akun (limit IP) walau lewat WS
+            if args.peer_map_state is not None:
+                registered_port = args.peer_map_state.register(target_writer, ip)
 
-        # Data yang sudah ikut terkirim setelah header tetap ada di buffer
-        # `reader` dan akan terbaca oleh pump di bawah (tanpa kehilangan byte).
-        upstream = asyncio.create_task(pump(reader, target_writer))
-        downstream = asyncio.create_task(pump(target_reader, writer))
-        done, pending = await asyncio.wait(
-            {upstream, downstream}, return_when=asyncio.FIRST_COMPLETED
-        )
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        for task in done:
-            exc = task.exception()
-            if exc and not isinstance(
-                exc,
-                (
-                    ConnectionResetError,
-                    ConnectionAbortedError,
-                    BrokenPipeError,
-                    asyncio.IncompleteReadError,
-                ),
-            ):
-                log.debug("task berhenti dengan error: %r", exc)
+            log.info(
+                "bridge aktif: %s -> %s:%s (request %s)",
+                peer,
+                args.target_host,
+                args.target_port,
+                path or "/",
+            )
+
+            # Data yang sudah ikut terkirim setelah header tetap ada di buffer
+            # `reader` dan akan terbaca oleh pump (tanpa kehilangan byte).
+            await relay(reader, writer, target_reader, target_writer)
+        finally:
+            if limited:
+                remaining = args.per_ip.get(ip, 1) - 1
+                if remaining > 0:
+                    args.per_ip[ip] = remaining
+                else:
+                    args.per_ip.pop(ip, None)
     except (ConnectionResetError, ConnectionAbortedError, asyncio.IncompleteReadError):
         pass
     except Exception as exc:  # noqa: BLE001 - satu klien tidak boleh menjatuhkan service
         log.warning("error menangani %s: %r", peer, exc)
     finally:
+        if registered_port is not None and args.peer_map_state is not None:
+            args.peer_map_state.unregister(registered_port)
         for closer in (target_writer, writer):
             if closer is None:
                 continue
@@ -253,8 +386,17 @@ def parse_target(value: str) -> Tuple[str, int]:
     return host, int(port)
 
 
+def parse_route(value: str) -> Tuple[str, str, int]:
+    """'/path=host:port' -> ('/path', 'host', port)."""
+    path, sep, target = value.partition("=")
+    if not sep or not path.strip() or not target.strip():
+        raise argparse.ArgumentTypeError("format route harus /path=host:port")
+    host, port = parse_target(target.strip())
+    return normalize_path(path.strip()), host, port
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="SSH over WebSocket bridge (handshake-only)")
+    p = argparse.ArgumentParser(description="SSH over WebSocket bridge + router Xray")
     p.add_argument("--listen", default="0.0.0.0", help="alamat bind (default 0.0.0.0)")
     p.add_argument("--port", type=int, required=True, help="port listen")
     p.add_argument(
@@ -262,10 +404,23 @@ def build_parser() -> argparse.ArgumentParser:
         default="/",
         help="path websocket; '/' (default) = terima semua path",
     )
-    p.add_argument("--target", default="127.0.0.1:22", help="target TCP (default 127.0.0.1:22)")
+    p.add_argument("--target", default="127.0.0.1:22", help="target TCP SSH (default 127.0.0.1:22)")
+    p.add_argument(
+        "--route",
+        action="append",
+        type=parse_route,
+        default=[],
+        metavar="/PATH=HOST:PORT",
+        help="teruskan path ini ke backend lain (mis. inbound Xray); bisa diulang",
+    )
     p.add_argument("--tls", action="store_true", help="aktifkan TLS (wss)")
     p.add_argument("--cert", help="path fullchain.pem")
     p.add_argument("--key", help="path privkey.pem")
+    p.add_argument(
+        "--peer-map",
+        default="",
+        help="file 'port|ip' berisi IP asli klien (dipakai penegakan limit IP)",
+    )
     p.add_argument("--handshake-timeout", type=float, default=10.0)
     p.add_argument("--connect-timeout", type=float, default=10.0)
     p.add_argument("--max-connections", type=int, default=1024)
@@ -291,45 +446,31 @@ async def run(args: argparse.Namespace) -> None:
         ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
 
     sem = asyncio.Semaphore(args.max_connections)
-    per_ip: dict = {}
+    # per-IP dijaga di dalam handle_client (hanya untuk jalur SSH)
+    args.per_ip = {}
+    args.routes = {route_path: (host, port) for route_path, host, port in args.route}
+    args.peer_map_state = PeerMap(args.peer_map) if args.peer_map else None
 
     async def wrapped(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         async with sem:
-            if args.max_per_ip <= 0:
-                await handle_client(reader, writer, args)
-                return
-            ip = peer_ip(writer.get_extra_info("peername"))
-            # batas per-IP mencegah satu sumber memakai seluruh kuota koneksi;
-            # tidak ada await di antara cek dan increment sehingga aman.
-            if per_ip.get(ip, 0) >= args.max_per_ip:
-                log.warning("batas %d koneksi per IP tercapai (%s)", args.max_per_ip, ip)
-                try:
-                    writer.close()
-                except OSError:
-                    pass
-                return
-            per_ip[ip] = per_ip.get(ip, 0) + 1
-            try:
-                await handle_client(reader, writer, args)
-            finally:
-                remaining = per_ip.get(ip, 1) - 1
-                if remaining > 0:
-                    per_ip[ip] = remaining
-                else:
-                    per_ip.pop(ip, None)
+            await handle_client(reader, writer, args)
 
     server = await asyncio.start_server(
         wrapped, host=args.listen, port=args.port, ssl=ssl_ctx, limit=MAX_HEADER
     )
     scheme = "wss" if args.tls else "ws"
     addr = ", ".join(str(sock.getsockname()[:2]) for sock in (server.sockets or []))
+    routes = "".join(
+        f", route {p} -> {h}:{port}" for p, (h, port) in sorted(args.routes.items())
+    )
     log.info(
-        "listen %s://%s%s -> %s:%s (pid=%d)",
+        "listen %s://%s%s -> sshd %s:%s%s (pid=%d)",
         scheme,
         addr,
         normalize_path(args.path),
         args.target_host,
         args.target_port,
+        routes,
         os.getpid(),
     )
 

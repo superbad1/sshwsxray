@@ -68,6 +68,58 @@ def start_echo_server():
     return port, srv, stop
 
 
+def start_backend_server(marker=b"X-Backend: XRAY"):
+    """Backend tiruan yang menjawab 101 SENDIRI (meniru inbound Xray).
+
+    `seen` menyimpan request mentah yang diterima backend, supaya test bisa
+    memastikan bridge meneruskan handshake asli (bukan membuat 101 sendiri).
+    """
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(16)
+    port = srv.getsockname()[1]
+    stop = threading.Event()
+    seen = []
+
+    def handle(conn):
+        with conn:
+            req = b""
+            while b"\r\n\r\n" not in req:
+                try:
+                    chunk = conn.recv(4096)
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                req += chunk
+            seen.append(req)
+            conn.sendall(
+                b"HTTP/1.1 101 Switching Protocols\r\n"
+                + marker
+                + b"\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+            )
+            while True:
+                try:
+                    data = conn.recv(65536)
+                except OSError:
+                    return
+                if not data:
+                    return
+                conn.sendall(b"BACKEND:" + data)
+
+    def serve():
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=handle, args=(conn,), daemon=True).start()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return port, srv, stop, seen
+
+
 def free_port():
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -156,7 +208,7 @@ class RawClient:
             pass
 
 
-def start_bridge(port, path, target_port, tls=False, cert=None, key=None, max_per_ip=0):
+def start_bridge(port, path, target_port, tls=False, cert=None, key=None, max_per_ip=0, routes=None, peer_map=None):
     """path=None -> mode standar '/' (tanpa path khusus).
 
     max_per_ip=0 -> tanpa batas per-IP (dipakai mayoritas test agar saling
@@ -171,6 +223,10 @@ def start_bridge(port, path, target_port, tls=False, cert=None, key=None, max_pe
     ]
     if path is not None:
         cmd += ["--path", path]
+    for route in routes or []:
+        cmd += ["--route", route]
+    if peer_map:
+        cmd += ["--peer-map", peer_map]
     if tls:
         cmd += ["--tls", "--cert", cert, "--key", key]
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
@@ -205,6 +261,14 @@ def main():
     # bridge dengan batas per-IP kecil untuk menguji proteksi abuse
     limited_port = free_port()
     bridge_limited = start_bridge(limited_port, None, echo_port, max_per_ip=2)
+
+    # bridge mode router: /rahasia -> backend Xray tiruan, sisanya -> echo (SSH)
+    backend_port, backend_srv, backend_stop, backend_seen = start_backend_server()
+    router_port = free_port()
+    bridge_router = start_bridge(
+        router_port, None, echo_port,
+        routes=["/rahasia=127.0.0.1:%d" % backend_port],
+    )
 
     try:
         # 1. handshake upgrade di path standar '/'
@@ -338,13 +402,102 @@ def main():
         except (ConnectionError, OSError):
             check("per-IP: slot bebas dipakai lagi", False, "koneksi ditolak")
         again.close()
+
+        # 13. mode router: path yang terdaftar diteruskan ke backend Xray,
+        #     dan backend (bukan bridge) yang menjawab 101.
+        r1 = RawClient(router_port)
+        r1.handshake(path="/rahasia")
+        check("router: path terdaftar dapat 101", r1.status == 101, r1.status)
+        check("router: 101 datang dari backend, bukan bridge",
+              r1.headers.get("x-backend") == "XRAY", r1.headers)
+        check("router: handshake diteruskan apa adanya",
+              any(b"Sec-WebSocket-Key" in req and b"GET /rahasia" in req
+                  for req in backend_seen), backend_seen)
+        r1.send(b"vmess-payload")
+        check("router: byte diteruskan dua arah",
+              r1.recv_exact(21) == b"BACKEND:vmess-payload")
+        r1.close()
+
+        # 14. query string diabaikan saat mencocokkan route
+        r2 = RawClient(router_port)
+        r2.handshake(path="/rahasia?ed=2048")
+        check("router: query string diabaikan",
+              r2.status == 101 and r2.headers.get("x-backend") == "XRAY", r2.status)
+        r2.close()
+
+        # 15. path yang tidak terdaftar tetap jalur SSH (bridge yang jawab 101)
+        r3 = RawClient(router_port)
+        r3.handshake(path="/apapun")
+        check("router: path lain tetap jalur SSH",
+              r3.status == 101 and r3.headers.get("x-backend") is None, r3.headers)
+        r3.send(b"ssh-payload")
+        check("router: jalur SSH tetap pipe ke sshd",
+              r3.recv_exact(11) == b"ssh-payload")
+        r3.close()
+
+        # 16. route di port TLS juga berfungsi (bridge yang menerima TLS)
+        tls_router_port = free_port()
+        bridge_router_tls = start_bridge(
+            tls_router_port, None, echo_port, tls=True, cert=cert, key=key,
+            routes=["/rahasia=127.0.0.1:%d" % backend_port],
+        )
+        try:
+            r4 = RawClient(tls_router_port, tls=True)
+            r4.handshake(path="/rahasia")
+            check("router TLS: path terdaftar diteruskan",
+                  r4.status == 101 and r4.headers.get("x-backend") == "XRAY",
+                  r4.status)
+            r4.send(b"wss-payload")
+            check("router TLS: byte diteruskan dua arah",
+                  r4.recv_exact(19) == b"BACKEND:wss-payload")
+            r4.close()
+        finally:
+            bridge_router_tls.terminate()
+
+        # 17. --peer-map: bridge mencatat IP asli klien selama koneksi hidup.
+        # Di sisi sshd semua klien WS tampak dari 127.0.0.1, jadi tanpa peta
+        # ini limit IP per akun tidak pernah tercapai.
+        peer_map_path = os.path.join(inst, "ws_peers.db")
+        peer_port = free_port()
+        peer_bridge = start_bridge(peer_port, None, echo_port, peer_map=peer_map_path)
+        try:
+            pclient = RawClient(peer_port)
+            pclient.handshake()
+            check("peer-map: handshake bridge", pclient.status == 101, pclient.status)
+            pclient.send(b"x")
+            check("peer-map: byte mengalir lewat bridge", pclient.recv_exact(1) == b"x")
+
+            lines = []
+            if os.path.exists(peer_map_path):
+                with open(peer_map_path) as fh:
+                    lines = [ln.strip() for ln in fh if ln.strip()]
+            entry_ok = len(lines) == 1 and lines[0].split("|")[-1] == "127.0.0.1"
+            check("peer-map: IP klien dicatat", entry_ok, lines)
+
+            pclient.close()
+            emptied = False
+            for _ in range(50):
+                try:
+                    with open(peer_map_path) as fh:
+                        emptied = fh.read().strip() == ""
+                except OSError:
+                    emptied = True
+                if emptied:
+                    break
+                time.sleep(0.1)
+            check("peer-map: entri dibersihkan setelah koneksi tutup", emptied)
+        finally:
+            peer_bridge.terminate()
     finally:
         bridge.terminate()
         bridge_tls.terminate()
         bridge_strict.terminate()
         bridge_limited.terminate()
+        bridge_router.terminate()
         echo_stop.set()
         echo_srv.close()
+        backend_stop.set()
+        backend_srv.close()
 
     print()
     if failures == 0:

@@ -43,12 +43,20 @@ check "is_expired (masa depan) false" "$(is_expired "$future" && echo yes || ech
 check "days_left 5" "$(days_left "$future")" "4"
 check "days_left overdue negatif" "$(days_left "$past" | grep -c '^-\|^0$')" "1"
 
+# ---------- token path acak ----------
+tok1=$(gen_token); tok2=$(gen_token)
+check "gen_token panjang 12" "${#tok1}" "12"
+check "gen_token hanya [a-z0-9]" "$(printf '%s' "$tok1" | grep -c '^[a-z0-9]*$')" "1"
+check "gen_token acak (dua panggilan beda)" "$([[ "$tok1" != "$tok2" ]] && echo beda)" "beda"
+tok_long=$(gen_token 20)
+check "gen_token panjang custom" "${#tok_long}" "20"
+
 # ---------- config save/load ----------
 save_config DOMAIN "contoh.com"
-save_config WS_PATH "wsxray"
+save_config XRAY_VMESS_WS_PATH "vmesspath123"
 load_config
 check "save/load DOMAIN" "$DOMAIN" "contoh.com"
-check "save/load WS_PATH" "$WS_PATH" "wsxray"
+check "save/load XRAY_VMESS_WS_PATH" "$XRAY_VMESS_WS_PATH" "vmesspath123"
 check "save_config sync var di shell" "$DOMAIN" "contoh.com"
 save_config DOMAIN "baru.com"
 check "save_config update existing" "$DOMAIN" "baru.com"

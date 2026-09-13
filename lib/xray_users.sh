@@ -83,10 +83,15 @@ xray_user_create() {
     expire=$(add_days "$days")
 
     db_add "$XRAY_DB" "${proto}|${uuid}|${user}|$(date +%F)|${expire}|${iplimit}"
-    xray_render_config && xray_safe_restart
+    if xray_render_config; then
+        xray_safe_restart
+    else
+        print_warning "Akun tersimpan di database, tapi config Xray gagal dirender."
+        print_warning "Jalankan menu Xray -> 9 (Rebuild config + restart)."
+    fi
 
     echo ""
-    print_success "Akun ${proto} '${user}' dibuat (expired ${expire}, limit ${iplimit} IP)"
+    print_success "Akun ${proto} '${user}' dibuat (expired ${expire})"
     xray_user_show "$proto" "$user"
     tg_send "✅ <b>AKUN ${proto^^} BARU</b>%0AUser: $(tg_escape "$user")%0AExpired: ${expire}"
     pause_menu
@@ -113,8 +118,12 @@ xray_user_trial() {
     uuid=$(_xray_gen_uuid) || { pause_menu; return 1; }
 
     db_add "$XRAY_DB" "${proto}|${uuid}|${user}|$(date +%F)|${expire}|1"
-    xray_render_config && xray_safe_restart
-    print_success "Trial ${proto} '${user}' dibuat (${TRIAL_HOURS} jam, 1 IP)"
+    if xray_render_config; then
+        xray_safe_restart
+    else
+        print_warning "Akun trial tersimpan, tapi config Xray gagal dirender (menu Xray -> 9)."
+    fi
+    print_success "Trial ${proto} '${user}' dibuat (${TRIAL_HOURS} jam)"
     xray_user_show "$proto" "$user"
     tg_send "🧪 <b>TRIAL ${proto^^}</b>%0AUser: $(tg_escape "$user")%0AExpired: ${expire}"
     pause_menu
@@ -163,8 +172,11 @@ xray_user_delete() {
     fi
     confirm "Yakin hapus akun ${proto} '${user}'?" || { pause_menu; return 0; }
     _xray_delete_record "$proto" "$user"
-    sed -i "/^[^|]*|${user}|/d" "$TRIAL_DB" 2>/dev/null
-    xray_render_config && xray_safe_restart
+    if xray_render_config; then
+        xray_safe_restart
+    else
+        print_warning "Akun dihapus dari database, tapi config Xray gagal dirender (menu Xray -> 9)."
+    fi
     print_success "Akun ${proto} '${user}' dihapus"
     tg_send "🗑 <b>AKUN ${proto^^} DIHAPUS</b>%0AUser: $(tg_escape "$user")"
     pause_menu
@@ -182,7 +194,7 @@ xray_user_list() {  # xray_user_list [brief|full]
         return 0
     fi
     echo -e "${CYAN}------------------------------------------------------------${NC}"
-    printf "${WHITE} %-7s %-16s %-20s %-5s %-10s${NC}\n" "PROTO" "USERNAME" "EXPIRED" "IPLIM" "TRAFFIC"
+    printf "${WHITE} %-7s %-16s %-20s %-5s %-10s${NC}\n" "PROTO" "STATUS" "EXPIRED" "IPLIM" "TRAFFIC"
     echo -e "${CYAN}------------------------------------------------------------${NC}"
     while IFS='|' read -r proto uuid user _created expired iplimit; do
         [[ -z "$proto" ]] && continue
@@ -220,29 +232,49 @@ xray_user_show() {  # xray_user_show <proto> <user>
     local domain
     domain=$(get_domain)
     local host="${domain:-$(pubip)}"
-    local path="${WS_PATH}"
+
+    # Klien menyambung ke port yang sama dengan SSH-WebSocket (80 polos / 443
+    # TLS) dan dibedakan lewat path acak milik protokolnya. Port lama
+    # (10086/10088/10091) tetap terbuka bila ingin disambung langsung.
+    local path port tls_mode
+    path="$(xray_ws_path "$proto")"
+    port="$(xray_client_port)"
+    tls_mode="none"
+    cert_paths >/dev/null 2>&1 && tls_mode="tls"
 
     echo -e "${CYAN}----------------------------------------------${NC}"
     echo -e " ${BOLD}AKUN ${proto^^}: ${user}${NC}"
     echo -e " UUID/Pass : ${uuid}"
     echo -e " Expired   : ${expired}"
     echo -e " Limit IP  : tidak berlaku (limit IP hanya untuk akun SSH)"
+    echo -e " Port      : ${port} $([[ "$tls_mode" == "tls" ]] && echo '(TLS, via bridge)' || echo '(polos, via bridge)')"
+    echo -e " Path      : /${path}"
     echo -e "${CYAN}----------------------------------------------${NC}"
 
     if [[ "$proto" == "vmess" ]]; then
         # vmess:// base64(JSON) — transport ws
-        local json b64
+        local json b64 vmess_tls=""
+        [[ "$tls_mode" == "tls" ]] && vmess_tls="tls"
         json=$(python3 -c "
 import json
-print(json.dumps({'v':'2','ps':'${user}-ws','add':'${host}','port':'${XRAY_VMESS_WS_PORT}','id':'${uuid}','aid':'0','scy':'auto','net':'ws','type':'none','host':'${host}','path':'/${path}','tls':''}, separators=(',',':')))
+print(json.dumps({'v':'2','ps':'${user}-ws','add':'${host}','port':'${port}','id':'${uuid}','aid':'0','scy':'auto','net':'ws','type':'none','host':'${host}','path':'/${path}','tls':'${vmess_tls}'}, separators=(',',':')))
 ")
         b64=$(echo -n "$json" | base64 -w0)
         echo -e " VMess WS    : vmess://${b64}"
     elif [[ "$proto" == "vless" ]]; then
-        echo -e " VLESS WS    : vless://${uuid}@${host}:${XRAY_VLESS_WS_PORT}?path=%2F${path}&security=none&encryption=none&type=ws#${user}-ws"
+        echo -e " VLESS WS    : vless://${uuid}@${host}:${port}?path=%2F${path}&security=${tls_mode}&encryption=none&type=ws&host=${host}&sni=${host}#${user}-ws"
     elif [[ "$proto" == "trojan" ]]; then
-        echo -e " Trojan WS   : trojan://${uuid}@${host}:${XRAY_TROJAN_WS_PORT}?path=%2F${path}&security=tls&sni=${host}&type=ws#${user}-ws"
+        # Trojan selalu TLS. Kalau belum ada cert, bridge 443 belum melayani
+        # path-nya, jadi link menunjuk ke port Trojan lama (punya TLS sendiri).
+        if [[ "$tls_mode" == "tls" ]]; then
+            echo -e " Trojan WS   : trojan://${uuid}@${host}:${port}?path=%2F${path}&security=tls&sni=${host}&type=ws#${user}-ws"
+        else
+            echo -e " Trojan WS   : trojan://${uuid}@${host}:${XRAY_TROJAN_WS_PORT}?path=%2F${path}&security=tls&sni=${host}&type=ws#${user}-ws"
+        fi
     fi
+    echo -e "${CYAN}----------------------------------------------${NC}"
+    echo -e " ${BOLD}Port langsung (Xray, tanpa bridge):${NC}"
+    echo -e " VMess ${XRAY_VMESS_WS_PORT} | VLESS ${XRAY_VLESS_WS_PORT} | Trojan ${XRAY_TROJAN_WS_PORT} (TLS)"
     echo -e "${CYAN}----------------------------------------------${NC}"
     return 0
 }

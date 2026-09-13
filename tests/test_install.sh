@@ -286,10 +286,15 @@ else
 print_warning() { echo "[WARN ] $1"; }
 print_error()   { echo "[ERROR] $1" >&2; }
 print_success() { echo "[ OK  ] $1"; }
+print_info()    { echo "[INFO ] $1"; }
 load_config()   { return 0; }
 apply_config_defaults() { return 0; }
 ensure_db_files() { return 0; }
 get_domain()    { echo ""; }
+STUB
+    # lib/bridge.sh ikut di-source oleh alur SSL; di fixture ini cukup stub
+    cat > "$SOLO_SSL/lib/bridge.sh" <<'STUB'
+bridge_write_units() { return 0; }
 STUB
     ssl_out="$(SSL_ONLY=1 bash "$SOLO_SSL/install.sh" </dev/null 2>&1)"
     ssl_rc=$?

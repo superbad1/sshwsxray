@@ -19,7 +19,7 @@ require_root
 load_config
 apply_config_defaults
 
-for lib in telegram ssh xray xray_users monitor backup expire; do
+for lib in telegram ssh xray xray_users monitor backup expire bridge; do
     # shellcheck disable=SC1091
     source "${SCRIPT_DIR}/lib/${lib}.sh"
 done
@@ -142,7 +142,10 @@ menu_settings() {
         load_config
         echo -e "  Domain           : ${DOMAIN:-belum diset}"
         echo -e "  Path SSH-WS      : / (standar, tanpa path)"
-        echo -e "  Path Xray WS     : /${WS_PATH}"
+        echo -e "  Path VMess       : /${XRAY_VMESS_WS_PATH:-belum dibuat}"
+        echo -e "  Path VLESS       : /${XRAY_VLESS_WS_PATH:-belum dibuat}"
+        echo -e "  Path Trojan      : /${XRAY_TROJAN_WS_PATH:-belum dibuat}"
+        echo -e "  Port Xray (klien): $(xray_client_port) (lewat bridge 80/443)"
         echo -e "  Transport Xray   : WebSocket (ws) saja"
         echo -e "  Batas WS per-IP  : ${WS_MAX_PER_IP:-16}"
         echo -e "  Batas IP default : ${IP_LIMIT}"
@@ -151,7 +154,7 @@ menu_settings() {
         echo -e "  Telegram         : $([[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]] && echo terkonfigurasi || echo belum)"
         echo ""
         echo -e "  1) Set domain"
-        echo -e "  2) Set path WebSocket (Xray)"
+        echo -e "  2) Buat path Xray baru (acak)"
         echo -e "  3) Set batas IP default"
         echo -e "  4) Set durasi trial (jam)"
         echo -e "  5) Toggle auto reboot"
@@ -173,10 +176,22 @@ menu_settings() {
                 fi
                 pause_menu ;;
             2)
-                read -rp "Path Xray WS (tanpa slash depan): " p
-                p="${p#/}"
-                [[ -n "$p" ]] && { save_config WS_PATH "$p"; print_success "Path Xray WS: /$p"; }
-                xray_render_config && xray_safe_restart
+                # Path Xray dibuat acak per protokol (VMess/VLESS/Trojan) supaya
+                # bisa dibedakan saat semuanya lewat port 80/443 bersama SSH-WS.
+                if confirm "Buat path Xray BARU untuk semua protokol? Link akun lama tidak berlaku"; then
+                    xray_ws_paths_generate
+                    if xray_render_config; then
+                        xray_safe_restart
+                    fi
+                    bridge_write_units
+                    print_success "Path Xray baru:"
+                    echo -e "   VMess  : /${XRAY_VMESS_WS_PATH}"
+                    echo -e "   VLESS  : /${XRAY_VLESS_WS_PATH}"
+                    echo -e "   Trojan : /${XRAY_TROJAN_WS_PATH}"
+                    print_warning "Link akun lama tidak berlaku - ambil ulang di menu Xray -> 6"
+                else
+                    print_info "Dibatalkan."
+                fi
                 pause_menu ;;
             3)
                 read -rp "Batas IP: " n

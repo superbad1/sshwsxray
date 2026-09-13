@@ -18,13 +18,18 @@ _make_archive() {  # -> prints archive path
     stamp=$(date +%Y%m%d-%H%M%S)
     file="${BACKUP_DIR}/backup-${hostname}-${stamp}.tar.gz"
     if declare -F _tg_archive_create >/dev/null 2>&1; then
-        _tg_archive_create "$file"
+        _tg_archive_create "$file" || { rm -f "$file"; return 1; }
     else
-        tar -czf "$file" /etc/sshwsxray 2>/dev/null
-        [[ -f "$XRAY_CONFIG" ]] && tar -rzf "$file" -C / usr/local/etc/xray/config.json 2>/dev/null
+        # fallback: tetap satu panggilan tar (tar -r tidak bisa menambah isi
+        # ke arsip .tar.gz, sehingga config Xray dulu selalu hilang)
+        local -a members=(etc/sshwsxray)
+        if [[ -f "$XRAY_CONFIG" ]]; then
+            members+=(usr/local/etc/xray/config.json)
+        fi
+        tar -czf "$file" -C / "${members[@]}" 2>/dev/null || { rm -f "$file"; return 1; }
         chmod 600 "$file" 2>/dev/null
     fi
-    [[ -s "$file" ]] || return 1
+    [[ -s "$file" ]] || { rm -f "$file"; return 1; }
     echo "$file"
 }
 

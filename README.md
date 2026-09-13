@@ -10,7 +10,7 @@ Autoscript instalasi dan manajemen user untuk tunnel **SSH over WebSocket** dan 
 - Masa aktif otomatis (expired date), akun trial per-jam, renew menjumlah dari sisa masa aktif
 
 **Keamanan & monitoring**
-- Limit IP per akun SSH — dihitung sendiri dari koneksi sshd yang aktif (`ss` + `ps`, tanpa script pihak ketiga), pemutusan oleh cron
+- Limit IP per akun SSH — dihitung sendiri dari koneksi sshd yang aktif (`ss` + `ps`, tanpa script pihak ketiga), pemutusan oleh cron. Klien yang masuk lewat WebSocket ikut terhitung benar-benar: bridge mencatat IP aslinya (`/etc/sshwsxray/ws_peers.db`), karena di sisi sshd koneksi WS terlihat datang dari loopback
 - Deteksi multi-login (alert Telegram saat sesi ganda terdeteksi, dengan cooldown 30 menit supaya tidak spam)
 - Auto-hapus akun Xray yang expired + lock akun SSH expired (dan otomatis dibuka lagi saat di-renew)
 - Traffic per akun Xray via StatsService API Xray (query via python, tanpa binary `nc`)
@@ -29,41 +29,58 @@ Autoscript instalasi dan manajemen user untuk tunnel **SSH over WebSocket** dan 
 ## Arsitektur
 
 ```
-Klien (HTTP-WS) ──► port 80/443  sshws.py  (WebSocket bridge, path /) ──► 127.0.0.1:22 (sshd)
-Klien (Vmess/Vless/Trojan ws)  ──► port 10086/10088/10091 (Xray, path /<WS_PATH>)
+                            ┌── path ≠ route ──► 127.0.0.1:22      (sshd)
+Klien ──► 80 / 443 ──► sshws.py (router berbasis path)
+                            ├── /<token vmess> ─► 127.0.0.1:10086 (Xray vmess ws)
+                            ├── /<token vless> ─► 127.0.0.1:10088 (Xray vless ws)
+                            └── /<token trojan ► 127.0.0.1:10093 (Xray trojan ws, tanpa TLS)
 ```
+
+**SSH-WebSocket dan Xray memakai port yang sama (80 dan 443).** Yang
+membedakan bukan port, melainkan **path** pada request upgrade — sama seperti
+cara nginx memisahkan beberapa layanan di satu port.
 
 Semua inbound Xray memakai transport **WebSocket** saja; gRPC dan Reality tidak dirender.
 
-- `sshws.py` hanya melakukan **handshake/upgrade** WebSocket (balas `101 Switching Protocols`), lalu stream TCP diteruskan mentah ke sshd lokal — tanpa framing, masking, ping/pong, atau pembungkusan payload.
-- SSH-WS memakai **path standar `/`**: tidak ada path khusus, jadi klien boleh meminta `/` maupun path lain. `WS_PATH` hanya dipakai Xray (VMess/VLESS/Trojan WS).
-- Bridge dijalankan dua instance: `sshws` (plain, port 80) dan `sshws-tls` (TLS via cert Let's Encrypt, port 443).
-- Xray listen langsung di 0.0.0.0 untuk WS (plain/TLS) dan gRPC; Trojan wajib TLS.
+- `sshws.py` menjalankan dua hal sekaligus:
+  - **jalur SSH** (default): balas `101 Switching Protocols` sendiri, lalu teruskan stream TCP mentah ke sshd — tanpa framing, masking, ping/pong, atau pembungkusan payload.
+  - **jalur Xray**: bila path cocok dengan sebuah `--route`, request upgrade diteruskan **apa adanya** ke inbound Xray (`Xray` sendiri yang menjawab 101), lalu byte disalurkan dua arah.
+- SSH-WS memakai **path standar `/`**: tidak ada path khusus, jadi klien boleh meminta `/` maupun path lain (bridge memeriksa route lebih dulu).
+- Setiap protokol Xray punya **path acak sendiri** (12 karakter, dibuat saat instalasi dan disimpan di config) supaya tidak mudah ditebak: VMess, VLESS, dan Trojan masing-masing satu token.
+- Bridge dijalankan dua instance: `sshws` (plain, port 80) dan `sshws-tls` (TLS via cert Let's Encrypt, port 443). Trojan hanya didaftarkan di 443 karena butuh TLS; TLS diterima bridge, jadi Xray memakai inbound kedua tanpa TLS di loopback (`trojan-mux-in`, port 10093).
+- Port lama Xray (10086/10088/10091) **tetap terbuka** bila ingin disambung langsung tanpa bridge; Trojan di 10091 memakai TLS-nya sendiri.
 - Konfigurasi Xray dirender dari database user (`/etc/sshwsxray/xray_users.db`) setiap ada perubahan akun, lalu service di-restart otomatis.
-- Cron tiap menit (`/usr/local/bin/sshwsxray-cron`): expire akun, limit IP, alert multi-login, auto reboot.
+- Cron tiap menit (`/usr/local/bin/sshwsxray-cron`): snapshot traffic Xray, expire akun, limit IP, alert multi-login, auto reboot.
 
 ## Bridge WebSocket (`lib/sshws.py`)
 
 Pengganti gost — ditulis dengan Python stdlib murni, tanpa dependency tambahan:
 
 ```bash
-# websocket biasa (port 80) — path standar '/', tanpa path khusus
-python3 lib/sshws.py --port 80  --target 127.0.0.1:22
+# websocket biasa (port 80): SSH di semua path, Xray di path yang didaftarkan
+python3 lib/sshws.py --port 80 --target 127.0.0.1:22 \
+    --route "/<token-vmess>=127.0.0.1:10086" \
+    --route "/<token-vless>=127.0.0.1:10088"
 
-# websocket secure (port 443)
+# websocket secure (port 443): ditambah route Trojan lewat inbound mux
 python3 lib/sshws.py --port 443 --target 127.0.0.1:22 \
+    --route "/<token-vmess>=127.0.0.1:10086" \
+    --route "/<token-vless>=127.0.0.1:10088" \
+    --route "/<token-trojan>=127.0.0.1:10093" \
     --tls --cert /etc/sshwsxray/cert/fullchain.pem --key /etc/sshwsxray/cert/privkey.pem
 ```
 
 | Flag | Fungsi | Default |
 |------|--------|---------|
 | `--port` | port listen (wajib) | — |
-| `--path` | path WebSocket; `/` = terima semua path | `/` |
-| `--target` | target TCP (sshd) | `127.0.0.1:22` |
+| `--path` | path untuk SSH; `/` = terima semua path | `/` |
+| `--target` | target TCP SSH (sshd) | `127.0.0.1:22` |
+| `--route` | `/path=host:port` — teruskan path itu ke backend lain (Xray); bisa diulang | — |
 | `--tls` `--cert` `--key` | aktifkan wss | nonaktif |
 | `--max-connections` | batas koneksi bersamaan | 1024 |
+| `--max-per-ip` | batas koneksi SSH per-IP (route Xray tidak dihitung) | 16 |
 | `--handshake-timeout` | timeout handshake | 10s |
-| `--connect-timeout` | timeout konek ke sshd | 10s |
+| `--connect-timeout` | timeout konek ke backend | 10s |
 | `--verbose` | log debug | nonaktif |
 
 Sudah ditangani: validasi header `Upgrade: websocket` + `Connection: Upgrade`,
@@ -76,7 +93,7 @@ Bila `--path` diisi selain `/`, pencocokan path ditegakkan lagi (path lain dibal
 Test:
 
 ```bash
-python3 tests/test_sshws.py     # 21 test: handshake '/', path bebas, mode ketat, echo mentah, pipelined, 1MB payload, TLS, konkurensi
+python3 tests/test_sshws.py     # 34 test: handshake '/', path bebas, mode ketat, echo mentah, pipelined, 1MB payload, TLS, konkurensi, per-IP, router --route (Xray) + TLS
 bash tests/test_install.sh      # bootstrap installer (stub curl, tanpa jaringan)
 bash tests/test_installer.sh    # fungsi installer di sandbox
 ```
@@ -135,32 +152,38 @@ sudo sshwsxray
 | 2) Xray | buat/trial/renew/hapus akun VMess/VLESS/Trojan, link sharing, traffic, restart service, rebuild config |
 | 3) Monitoring | info sistem, user online, cek masa aktif, speedtest |
 | 4) Backup & Restore | backup tar.gz lokal (rotasi 5), kirim ke Telegram, restore |
-| 5) Pengaturan | domain, path WS (Xray), limit IP, trial, auto reboot, Telegram bot, SSL |
+| 5) Pengaturan | domain, path Xray (acak), limit IP, trial, auto reboot, Telegram bot, SSL |
 
 ## Port Default
 
-| Port | Layanan |
-|------|---------|
-| 22 | OpenSSH |
-| 80 | SSH over WebSocket (ws, bridge `sshws.service`, path standar `/`) |
-| 443 | SSH over WebSocket Secure (wss, bridge `sshws-tls.service`, path standar `/`, butuh SSL) |
-| 10085 | Xray stats API (localhost only) |
-| 10086 | VMess WebSocket |
-| 10087 | _(tidak dipakai — gRPC dihapus)_ |
-| 10088 | VLESS WebSocket |
-| 10089 | _(tidak dipakai — gRPC dihapus)_ |
-| 10090 | _(tidak dipakai — Reality dihapus)_ |
-| 10091 | Trojan WebSocket (TLS) |
-| 10092 | _(tidak dipakai — gRPC dihapus)_ |
+| Port | Layanan | Untuk klien |
+|------|---------|-------------|
+| 22 | OpenSSH | SSH langsung |
+| **80** | **bridge `sshws.service`** (ws) | **SSH-WebSocket + VMess WS + VLESS WS** (dibedakan path) |
+| **443** | **bridge `sshws-tls.service`** (wss, butuh SSL) | **SSH-WSS + VMess WS + VLESS WS + Trojan WS** (dibedakan path) |
+| 10085 | Xray stats API | tidak — localhost saja (dipakai cron) |
+| 10086 | VMess WebSocket langsung | opsional (tanpa bridge) |
+| 10088 | VLESS WebSocket langsung | opsional (tanpa bridge) |
+| 10091 | Trojan WebSocket (TLS sendiri) | opsional (tanpa bridge) |
+| 10093 | Trojan mux (`trojan-mux-in`) | tidak — loopback, dipakai bridge 443 |
+| 10087/10089/10090/10092 | _(tidak dipakai — gRPC & Reality dihapus)_ | — |
+
+Klien cukup memakai **80 atau 443** untuk semuanya; path acak yang menentukan
+protokolnya (lihat `sudo sshwsxray` → 5, atau menu Xray → 6 untuk link akun).
+Port 10086/10088/10091 tetap terbuka bila ingin menyambung langsung.
 
 Semua port dapat diubah di `/etc/sshwsxray/config` lalu restart service.
+Mengganti path dilakukan lewat **menu 5 → 2** (path baru dibuat acak, config
+Xray dirender ulang, unit bridge ditulis ulang, lalu kedua service di-restart).
 
 Kalau `ufw` terpasang & aktif, installer membuka port-port di atas otomatis.
 Kalau tidak, pastikan port tersebut terbuka di firewall/security group VPS
 (pesan peringatan akan ditampilkan di akhir instalasi).
 
 `WS_MAX_PER_IP` (default `16`) membatasi jumlah koneksi SSH-WebSocket
-bersamaan dari satu alamat IP; isi `0` untuk mematikannya.
+bersamaan dari satu alamat IP; isi `0` untuk mematikannya. Koneksi Xray lewat
+bridge **tidak** dihitung, karena satu klien Xray bisa membuka banyak koneksi
+sah.
 
 ## File Penting
 
@@ -170,6 +193,8 @@ bersamaan dari satu alamat IP; isi `0` untuk mematikannya.
 | `/etc/sshwsxray/ssh_users.db` | Database user SSH |
 | `/etc/sshwsxray/xray_users.db` | Database akun Xray |
 | `/etc/sshwsxray/xray_traffic.db` | Snapshot traffic per akun |
+| `/etc/sshwsxray/config` | juga menyimpan path acak: `XRAY_VMESS_WS_PATH`, `XRAY_VLESS_WS_PATH`, `XRAY_TROJAN_WS_PATH` |
+| `/usr/local/lib/sshwsxray/lib/bridge.sh` | Penulisan unit systemd bridge (route Xray per protokol) |
 | `/usr/local/etc/xray/config.json` | Config Xray (dirender otomatis) |
 | `/usr/local/lib/sshwsxray/install.sh` | Installer (dipakai menu 5 → 8 untuk SSL) |
 | `/usr/local/lib/sshwsxray/menu.sh` | Menu utama (`sshwsxray`) |
@@ -206,3 +231,4 @@ sudo bash uninstall.sh
 ```
 
 Menghapus service sshws/Xray, binary, cron, dan `/etc/sshwsxray`, lalu restore sshd_config dari backup.
+Akun SSH/trial yang dibuat script juga dihapus (`userdel -r`, termasuk home dan file info di `/root/<user>-ssh-ws.txt`).

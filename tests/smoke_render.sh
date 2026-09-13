@@ -36,15 +36,24 @@ tags = [i["tag"] for i in cfg["inbounds"]]
 for t in ("api", "vmess-ws-in", "vless-ws-in"):
     assert t in tags, (t, tags)
 assert "trojan-ws-in" not in tags, tags
+# tanpa cert, inbound mux juga belum ada
+assert "trojan-mux-in" not in tags, tags
 for t in $FORBIDDEN:
     assert t not in tags, (t, tags)
 # transport WS harus bisa diakses dari luar (bukan loopback)
 for tag in ("vmess-ws-in", "vless-ws-in"):
     ib = next(i for i in cfg["inbounds"] if i["tag"] == tag)
     assert ib["listen"] == "0.0.0.0", (tag, ib["listen"])
-    assert ib["streamSettings"]["network"] == "ws", (tag, ib["streamSettings"]["network"])
+    assert ib["streamSettings"]["network"] == "ws", (tag, ib["streamSettings"])
     assert ib["streamSettings"]["wsSettings"]["path"].startswith("/"), tag
     assert "grpcSettings" not in ib["streamSettings"], tag
+# path acak per protokol: beda satu sama lain, dan bukan path lama
+paths = [next(i for i in cfg["inbounds"] if i["tag"] == t)["streamSettings"]["wsSettings"]["path"]
+         for t in ("vmess-ws-in", "vless-ws-in")]
+assert len(set(paths)) == 2, paths
+for p in paths:
+    assert p.strip("/") != "wsxray", p
+    assert len(p.strip("/")) == 12, p
 # tidak ada sisa transport grpc/reality di config
 raw = open(sys.argv[1]).read()
 assert '"grpc"' not in raw, "masih ada transport grpc"
@@ -78,6 +87,15 @@ assert tr["settings"]["clients"][0]["email"] == "trojanpass@trojan-ws-in"
 assert tr["streamSettings"]["security"] == "tls"
 assert tr["listen"] == "0.0.0.0", tr["listen"]
 assert tr["streamSettings"]["network"] == "ws", tr["streamSettings"]["network"]
+
+# inbound mux: dipakai bridge 443 yang sudah menerima TLS, jadi polos dan
+# hanya loopback, dengan path yang sama seperti inbound Trojan publik
+mux = next(i for i in cfg["inbounds"] if i["tag"] == "trojan-mux-in")
+assert mux["listen"] == "127.0.0.1", mux["listen"]
+assert mux["streamSettings"]["security"] == "none", mux["streamSettings"]["security"]
+assert mux["streamSettings"]["network"] == "ws"
+assert mux["streamSettings"]["wsSettings"]["path"] == tr["streamSettings"]["wsSettings"]["path"]
+assert mux["settings"]["clients"][0]["password"] == "trojanpass"
 print("RENDER (with cert) OK:", ", ".join(tags))
 EOF
 

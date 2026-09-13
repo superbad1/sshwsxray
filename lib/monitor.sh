@@ -83,10 +83,32 @@ _peer_ip() {  # buang port dari "ip:port" / "[v6]:port"
     echo "$a"
 }
 
+_peer_port() {  # ambil port dari "ip:port" / "[v6]:port"
+    local a="$1"
+    echo "${a##*:}"
+}
+
+# Kembalikan IP asli klien untuk sebuah sesi sshd.
+# Koneksi yang masuk lewat bridge WebSocket diteruskan ke sshd dari 127.0.0.1,
+# jadi `ss` melaporkan peer loopback untuk pengguna WS - padahal WS justru
+# jalur utamanya. Akibatnya limit IP per akun tidak pernah tercapai (semua IP
+# unik terbaca 1). Bridge menuliskan pemetaan port->ip di $WS_PEER_MAP
+# (lib/sshws.py --peer-map) dan di sini petanya dibaca kembali.
+_real_ip_for_peer() {  # _real_ip_for_peer <ip> <port>
+    local ip="$1" port="$2" real
+    case "$ip" in
+        127.0.0.1|::1|localhost|unknown) ;;
+        *) printf '%s' "$ip"; return 0 ;;
+    esac
+    [[ -f "$WS_PEER_MAP" ]] || { printf '%s' "$ip"; return 0; }
+    real=$(awk -F'|' -v p="$port" '$1==p {print $2; exit}' "$WS_PEER_MAP" 2>/dev/null)
+    printf '%s' "${real:-$ip}"
+}
+
 # cetak "user ip" untuk tiap sesi SSH yang sedang berjalan
 _ssh_session_pairs() {
     command -v ss &>/dev/null || return 0
-    local line peer pid owner
+    local line peer pid owner ip port
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         peer=$(echo "$line" | awk '{print $5}')
@@ -95,7 +117,9 @@ _ssh_session_pairs() {
         # sshd child yang memegang socket sudah turun ke user pemilik sesi
         owner=$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')
         [[ -z "$owner" || "$owner" == "root" ]] && continue
-        printf '%s %s\n' "$owner" "$(_peer_ip "$peer")"
+        ip=$(_peer_ip "$peer")
+        port=$(_peer_port "$peer")
+        printf '%s %s\n' "$owner" "$(_real_ip_for_peer "$ip" "$port")"
     done < <(ss -H -tn state established '( sport = :22 )' -p 2>/dev/null)
 }
 

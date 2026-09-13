@@ -4,14 +4,27 @@ Panduan menghubungkan aplikasi klien ke server yang di-install sshwsxray autoscr
 
 ## Port Ringkas
 
-| Layanan | Port | TLS | Catatan |
-|---------|------|-----|---------|
-| SSH langsung | 22 | - | client SSH biasa |
-| SSH over WS | 80 | tidak | path standar `/` (tanpa path khusus) |
-| SSH over WSS | 443 | ya | path standar `/` (tanpa path khusus) |
-| VMess WS | 10086 | tidak | path `/<WS_PATH>` |
-| VLESS WS | 10088 | tidak | path `/<WS_PATH>` |
-| Trojan WS | 10091 | ya | path `/<WS_PATH>`, wajib domain+SSL |
+**SSH-WebSocket dan Xray berjalan di port yang sama**: 80 (polos) dan 443
+(TLS). Yang membedakan adalah **path** pada request upgrade — seperti nginx
+memisahkan beberapa layanan di satu port.
+
+| Layanan | Port | TLS | Path |
+|---------|------|-----|------|
+| SSH langsung | 22 | - | - |
+| SSH over WS | 80 | tidak | path apa saja (bridge) |
+| SSH over WSS | 443 | ya | path apa saja (bridge) |
+| VMess WS | **80 / 443** | 443 saja | `/<token vmess>` |
+| VLESS WS | **80 / 443** | 443 saja | `/<token vless>` |
+| Trojan WS | **443** | ya | `/<token trojan>` |
+
+> Path itu **acak** (12 karakter) dan berbeda untuk setiap protokol. Ambil nilai
+> persisnya dari **menu Xray → 6) Detail & link akun**, dari **menu 5
+> (Pengaturan)**, atau dari `/etc/sshwsxray/config`:
+> `XRAY_VMESS_WS_PATH`, `XRAY_VLESS_WS_PATH`, `XRAY_TROJAN_WS_PATH`.
+
+Port lama Xray **tetap terbuka** kalau mau menyambung langsung tanpa bridge:
+VMess `10086` (`/<token vmess>`), VLESS `10088` (`/<token vless>`), Trojan
+`10091` (TLS sendiri, `/<token trojan>`).
 
 > Limit IP per akun **hanya berlaku untuk akun SSH**. Akun Xray tidak punya penegakan limit IP (Xray tidak menyediakan info per-akun per-IP).
 
@@ -59,17 +72,19 @@ vmess://<base64 dari JSON di bawah>
   "v": "2",
   "ps": "nama-akun",
   "add": "DOMAIN",
-  "port": "10086",
+  "port": "443",
   "id": "UUID-KAMU",
   "aid": "0",
   "scy": "auto",
   "net": "ws",
   "type": "none",
   "host": "DOMAIN",
-  "path": "/<WS_PATH>",
-  "tls": ""
+  "path": "/<token vmess>",
+  "tls": "tls"
 }
 ```
+
+Tanpa SSL, port-nya `80` dan `"tls": ""`.
 
 Aplikasi: v2rayNG (Android), v2box / Shadowrocket / Streisand (iOS), v2rayN (Windows), V2RayXS (macOS). Import link atau isi manual.
 
@@ -77,14 +92,21 @@ Aplikasi: v2rayNG (Android), v2box / Shadowrocket / Streisand (iOS), v2rayN (Win
 
 **VLESS WS**:
 ```
-vless://UUID@DOMAIN:10088?path=%2F<WS_PATH>&security=none&encryption=none&type=ws#nama-akun
+vless://UUID@DOMAIN:443?path=%2F<token vless>&security=tls&encryption=none&type=ws&host=DOMAIN&sni=DOMAIN#nama-akun
 ```
+
+Tanpa SSL: `DOMAIN:80` dan `security=none`.
 
 ## 5. Trojan (wajib domain + SSL)
 
-**Trojan WS**:
+**Trojan WS** (lewat bridge 443, TLS diterima bridge):
 ```
-trojan://PASSWORD@DOMAIN:10091?path=%2F<WS_PATH>&security=tls&sni=DOMAIN&type=ws#nama-akun
+trojan://PASSWORD@DOMAIN:443?path=%2F<token trojan>&security=tls&sni=DOMAIN&type=ws#nama-akun
+```
+
+Tanpa cert, Trojan hanya tersedia di port lamanya (TLS sendiri):
+```
+trojan://PASSWORD@DOMAIN:10091?path=%2F<token trojan>&security=tls&sni=DOMAIN&type=ws#nama-akun
 ```
 
 Aplikasi: sama dengan VMess/VLESS (semuanya mendukung trojan).
@@ -101,3 +123,6 @@ Aplikasi: sama dengan VMess/VLESS (semuanya mendukung trojan).
 | Sudah konek lalu diputus terus | batas IP akun SSH terlewati (hitung IP unik dari sesi sshd); cek `IP_LIMIT` di `/etc/sshwsxray/config` atau menu 5 → 3 |
 | Koneksi SSH-WS ditolak random | `WS_MAX_PER_IP` (default 16) membatasi koneksi bersamaan per IP; naikkan atau set `0` di `/etc/sshwsxray/config` |
 | Config lama masih ada gRPC/Reality | menu 2 (Xray) → 9) Rebuild config + restart |
+| VMess/VLESS lewat 80/443 konek tapi tidak jalan | pastikan **path** di klien sama persis dengan token di menu (path salah → request diperlakukan sebagai SSH dan gagal) |
+| Ganti path Xray | menu 5 → 2 (path dibuat ulang secara acak); semua link akun harus diperbarui |
+| Xray tidak jalan tapi SSH-WS jalan | route bridge: `journalctl -u sshws -n 30` akan menampilkan `route /<token> -> 127.0.0.1:<port>` |

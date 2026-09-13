@@ -45,19 +45,65 @@ xray_safe_restart() {
     return 1
 }
 
+# ---------- Path WebSocket Xray (acak, satu per protokol) ----------
+# Port 80/443 dipakai bersama SSH-WebSocket dan Xray, jadi path pada request
+# upgrade itulah yang menentukan tujuan (bridge lib/sshws.py yang membaca).
+# Path dibuat acak supaya tidak mudah ditebak, dan disimpan di config supaya
+# link akun tetap valid setelah restart/reboot.
+xray_ws_paths_generate() {  # paksa path baru (dipakai menu)
+    XRAY_VMESS_WS_PATH="$(gen_token)"
+    XRAY_VLESS_WS_PATH="$(gen_token)"
+    XRAY_TROJAN_WS_PATH="$(gen_token)"
+    save_config XRAY_VMESS_WS_PATH "$XRAY_VMESS_WS_PATH"
+    save_config XRAY_VLESS_WS_PATH "$XRAY_VLESS_WS_PATH"
+    save_config XRAY_TROJAN_WS_PATH "$XRAY_TROJAN_WS_PATH"
+    return 0
+}
+
+xray_ws_paths_ensure() {  # hanya isi yang masih kosong
+    [[ -n "${XRAY_VMESS_WS_PATH:-}"  ]] || { XRAY_VMESS_WS_PATH="$(gen_token)";  save_config XRAY_VMESS_WS_PATH "$XRAY_VMESS_WS_PATH"; }
+    [[ -n "${XRAY_VLESS_WS_PATH:-}"  ]] || { XRAY_VLESS_WS_PATH="$(gen_token)";  save_config XRAY_VLESS_WS_PATH "$XRAY_VLESS_WS_PATH"; }
+    [[ -n "${XRAY_TROJAN_WS_PATH:-}" ]] || { XRAY_TROJAN_WS_PATH="$(gen_token)"; save_config XRAY_TROJAN_WS_PATH "$XRAY_TROJAN_WS_PATH"; }
+    return 0
+}
+
+# Path yang dipakai klien untuk sebuah protokol (kosong bila belum ada)
+xray_ws_path() {  # xray_ws_path <vmess|vless|trojan>
+    case "$1" in
+        vmess)  echo "$XRAY_VMESS_WS_PATH" ;;
+        vless)  echo "$XRAY_VLESS_WS_PATH" ;;
+        trojan) echo "$XRAY_TROJAN_WS_PATH" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Port tempat klien menyambung: 443 (TLS, lewat bridge) bila cert tersedia,
+# kalau tidak 80 (polos). Port lama (10086/10088/10091) tetap terbuka juga.
+xray_client_port() {
+    load_config
+    apply_config_defaults
+    if cert_paths >/dev/null 2>&1; then
+        echo "${WSS_PORT:-443}"
+    else
+        echo "${WS_PORT:-80}"
+    fi
+}
+
 # ---------- Config render ----------
 # Renders /usr/local/etc/xray/config.json from $XRAY_DB.
 # Inbound ports read from saved config so edits persist.
 xray_render_config() {
     # pull latest settings (domain, cert dir, ports)
     load_config
+    apply_config_defaults
+    # path acak wajib ada sebelum inbound dirender
+    xray_ws_paths_ensure
     # simpan config lama: dipakai untuk rollback bila hasil render tidak valid
     local prev_config=""
     if [[ -f "$XRAY_CONFIG" ]]; then
         prev_config=$(mktemp)
         cp "$XRAY_CONFIG" "$prev_config"
     fi
-    apply_config_defaults
     local domain
     domain=$(get_domain)
     local cert=""
@@ -80,16 +126,17 @@ EOF
 )
     fi
 
+    # Setiap protokol punya path acak sendiri: port 80/443 dipakai bersama
+    # SSH-WebSocket, dan path itulah yang menentukan request upgrade menuju
+    # inbound yang mana (dibaca oleh bridge lib/sshws.py).
     make_ws_inbound() {
-        local tag="$1" port="$2" proto="$3"
-        local security="none" tls_json=""
-        # WS harus listen 0.0.0.0 supaya klien dari luar bisa konek;
-        # TLS hanya untuk Trojan (butuh cert), protokol lain plain.
-        [[ "$proto" == "trojan" ]] && security="tls" && tls_json="$tls_block"
+        local tag="$1" listen="$2" port="$3" proto="$4" ws_path="$5"
+        local security="${6:-none}" tls_json=""
+        [[ "$security" == "tls" ]] && tls_json="$tls_block"
         cat <<EOF
         {
             "tag": "${tag}",
-            "listen": "0.0.0.0",
+            "listen": "${listen}",
             "port": ${port},
             "protocol": "${proto}",
             "settings": {
@@ -100,7 +147,7 @@ EOF
                 "network": "ws",
                 "security": "${security}",
                 "tlsSettings": ${tls_json:-"{}"},
-                "wsSettings": {"path": "/${WS_PATH}"}
+                "wsSettings": {"path": "/${ws_path}"}
             },
             "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"]}
         }
@@ -117,7 +164,11 @@ EOF
     local trojan_ws_json=""
     if [[ -n "$cert" ]]; then
         # leading comma: inbound sebelumnya (vless-ws) belum punya koma
-        trojan_ws_json=", $(make_ws_inbound "trojan-ws-in" "$XRAY_TROJAN_WS_PORT" "trojan")"
+        # inbound publik: TLS sendiri (fungsinya sebagai Trojan tetap utuh)
+        trojan_ws_json=", $(make_ws_inbound "trojan-ws-in" "0.0.0.0" "$XRAY_TROJAN_WS_PORT" "trojan" "$XRAY_TROJAN_WS_PATH" "tls")"
+        # inbound kedua tanpa TLS, hanya loopback: dipakai bridge di port 443,
+        # yang sudah menerima TLS dari klien (TLS tidak bisa ditumpuk dua kali)
+        trojan_ws_json+=", $(make_ws_inbound "trojan-mux-in" "127.0.0.1" "$XRAY_TROJAN_MUX_PORT" "trojan" "$XRAY_TROJAN_WS_PATH" "none")"
     fi
 
     # --- Collect clients per protocol ---
@@ -166,8 +217,8 @@ EOF
             "protocol": "dokodemo-door",
             "settings": {"address": "127.0.0.1"}
         },
-$(make_ws_inbound "vmess-ws-in" "$XRAY_VMESS_WS_PORT" "vmess"),
-$(make_ws_inbound "vless-ws-in" "$XRAY_VLESS_WS_PORT" "vless")${trojan_ws_json}
+$(make_ws_inbound "vmess-ws-in" "0.0.0.0" "$XRAY_VMESS_WS_PORT" "vmess" "$XRAY_VMESS_WS_PATH"),
+$(make_ws_inbound "vless-ws-in" "0.0.0.0" "$XRAY_VLESS_WS_PORT" "vless" "$XRAY_VLESS_WS_PATH")${trojan_ws_json}
     ],
     "outbounds": [
         {"tag": "direct", "protocol": "freedom"},
@@ -192,7 +243,11 @@ EOF
     inject_clients "vmess-ws-in"  "[${vmess_clients}]"
     inject_clients "vless-ws-in"  "[${vless_clients}]"
     [[ -n "$trojan_clients_obj" ]] || trojan_clients_obj=''
-    inject_clients "trojan-ws-in" "[${trojan_clients_obj}]"
+    if [[ -n "$cert" ]]; then
+        inject_clients "trojan-ws-in"  "[${trojan_clients_obj}]"
+        # inbound mux harus punya daftar klien yang sama
+        [[ -n "$trojan_clients_obj" ]] && inject_clients "trojan-mux-in" "[${trojan_clients_obj}]"
+    fi
 
     # Validasi hasil render; kalau rusak, kembalikan config sebelumnya supaya
     # service yang sedang jalan tidak ikut mati.

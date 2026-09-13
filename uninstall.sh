@@ -49,6 +49,23 @@ rm -rf /usr/local/lib/sshwsxray
 # mencoba me-restart service yang sudah dihapus setiap kali cert diperbarui
 rm -f /etc/letsencrypt/renewal-hooks/deploy/sshwsxray.sh
 
+echo -e "\n${CYAN}==> Hapus akun sistem buatan script${NC}"
+# Akun SSH/trial adalah user Linux asli. Tanpa langkah ini, uninstall hanya
+# menghapus database & config sementara akunnya tetap ada di /etc/passwd.
+if [[ -f /etc/sshwsxray/ssh_users.db ]]; then
+    while IFS='|' read -r _user _rest; do
+        [[ -z "$_user" || "$_user" == "root" ]] && continue
+        id "$_user" &>/dev/null || continue
+        pkill -u "$_user" 2>/dev/null
+        if userdel -r "$_user" 2>/dev/null || userdel "$_user" 2>/dev/null; then
+            echo "  - akun ${_user} dihapus"
+        else
+            print_warning "Akun ${_user} gagal dihapus - hapus manual: userdel -r ${_user}"
+        fi
+        rm -f "/root/${_user}-ssh-ws.txt"
+    done < /etc/sshwsxray/ssh_users.db
+fi
+
 echo -e "\n${CYAN}==> Hapus data${NC}"
 rm -rf /etc/sshwsxray
 

@@ -31,6 +31,7 @@ install.sh
 menu.sh
 uninstall.sh
 lib/backup.sh
+lib/bridge.sh
 lib/common.sh
 lib/expire.sh
 lib/monitor.sh
@@ -43,9 +44,8 @@ lib/xray_proto.py
 lib/xray_render.py
 "
 
-INSTALL_DIR="${SSHWSXRAY_INSTALL_DIR:-/etc/sshwsxray}"
-APP_DIR="${SSHWSXRAY_APP_DIR:-/usr/local/lib/sshwsxray}"
-BIN_DIR="/usr/local/bin"
+# INSTALL_DIR / APP_DIR / BIN_DIR didefinisikan di lib/common.sh supaya
+# installer, menu, dan lib/bridge.sh memakai nilai yang sama.
 TMP_DIR=""
 
 # Dari mana berkas ini dijalankan:
@@ -78,6 +78,19 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # proses tidak punya controlling terminal, dan kegagalannya baru muncul saat
 # dibuka ("No such device or address"). Jadi dicoba dibuka sungguhan.
 tty_usable() { ( true </dev/tty ) 2>/dev/null; }
+
+# Baca satu baris jawaban user.
+# Di bawah 'set -e' sebuah 'read' yang gagal (stdin sudah habis, mis. saat
+# installer dijalankan Ansible/cloud-init tanpa terminal) menghentikan
+# SELURUH instalasi tanpa pesan apa pun. Jadi EOF di sini diperlakukan
+# sebagai jawaban kosong, bukan kesalahan.
+ask() {  # ask "<prompt>" <namavariabel>
+    local _prompt="$1" _name="$2" _value=""
+    printf '%s' "$_prompt" >&2
+    IFS= read -r _value || true
+    printf -v "$_name" '%s' "$_value"
+    return 0
+}
 
 fetch() {  # fetch <url> <dest>
     if have curl; then
@@ -114,7 +127,14 @@ download_app_files() {
         || die "install.sh tidak terunduh dengan benar (berkas kosong)"
 }
 
-cleanup_tmp() { [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"; }
+# Selalu return 0: fungsi ini dipanggil dari trap EXIT, dan status non-zero
+# di dalam trap membuat instalasi terlihat gagal padahal berhasil.
+cleanup_tmp() {
+    if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
+        rm -rf "$TMP_DIR"
+    fi
+    return 0
+}
 
 # Jalankan salinan installer hasil unduhan (yang sudah punya lib/ di sebelahnya)
 run_downloaded_copy() {
@@ -156,9 +176,15 @@ check_port_free() {  # <port> <svcname>
 install_packages() {
     log_step "Update sistem & install dependencies"
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y >/dev/null
-    apt-get install -y curl wget tar jq python3 openssl cron ca-certificates \
-        openssh-server speedtest-cli >/dev/null
+    # apt-get update bisa gagal karena satu mirror yang sedang bermasalah.
+    # Itu bukan alasan untuk membatalkan instalasi tanpa pesan.
+    apt-get update -y >/dev/null 2>&1 || warn "apt-get update gagal - lanjut dengan indeks paket yang ada"
+    # iproute2 (ss) dipakai monitoring & penegakan limit IP; procps (pkill, ps)
+    # dipakai untuk memutus sesi user yang melewati batas. Keduanya dulu tidak
+    # diminta, sehingga limit IP bisa gagal senyap di image minimal.
+    apt-get install -y curl wget tar python3 openssl cron ca-certificates \
+        openssh-server iproute2 procps speedtest-cli >/dev/null 2>&1 \
+        || die "Gagal memasang paket dasar sistem - periksa output apt di atas"
 }
 
 configure_ssh() {
@@ -195,74 +221,11 @@ EOF
     return 0
 }
 
-# Bridge WebSocket kustom (pure Python, pengganti gost)
-install_sshws() {
-    log_step "Install bridge SSH-WebSocket (lib/sshws.py)"
-    load_config
-    # SSH-WS memakai path standar '/' (tanpa path khusus); WS_PATH hanya untuk Xray
-    local ws_port="${WS_PORT:-80}"
-    local wss_port="${WSS_PORT:-443}"
-    local max_per_ip="${WS_MAX_PER_IP:-16}"
-
-    # pastikan script bridge ada sebelum unit systemd dibuat
-    mkdir -p "$APP_DIR"
-    if [[ "${SCRIPT_DIR}/lib/sshws.py" != "${APP_DIR}/sshws.py" ]]; then
-        install -m 644 "${SCRIPT_DIR}/lib/sshws.py" "${APP_DIR}/sshws.py"
-    fi
-    [[ -f "${APP_DIR}/sshws.py" ]] || { print_error "${APP_DIR}/sshws.py tidak ditemukan"; return 1; }
-
-    # ---- websocket biasa (port 80) -> sshd ----
-    cat > /etc/systemd/system/sshws.service <<EOF
-[Unit]
-Description=SSH over WebSocket (custom python bridge)
-After=network.target ssh.service
-
-[Service]
-Type=simple
-ExecStart=$(command -v python3) ${APP_DIR}/sshws.py --port ${ws_port} --target 127.0.0.1:22 --max-per-ip ${max_per_ip}
-Restart=always
-RestartSec=3
-NoNewPrivileges=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    # ---- websocket secure (port 443, butuh cert) -> sshd ----
-    if [[ -f "${INSTALL_DIR}/cert/fullchain.pem" ]]; then
-        cat > /etc/systemd/system/sshws-tls.service <<EOF
-[Unit]
-Description=SSH over WSS (custom python bridge, TLS)
-After=network.target ssh.service
-
-[Service]
-Type=simple
-ExecStart=$(command -v python3) ${APP_DIR}/sshws.py --port ${wss_port} --target 127.0.0.1:22 --max-per-ip ${max_per_ip} --tls --cert ${INSTALL_DIR}/cert/fullchain.pem --key ${INSTALL_DIR}/cert/privkey.pem
-Restart=always
-RestartSec=3
-NoNewPrivileges=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    fi
-
-    systemctl daemon-reload
-    if [[ -f /etc/systemd/system/sshws-tls.service ]]; then
-        systemctl enable sshws sshws-tls
-        systemctl restart sshws-tls 2>/dev/null || true
-    else
-        systemctl enable sshws
-    fi
-    systemctl restart sshws 2>/dev/null || true
-    return 0
-}
-
 # Tidak memaksa firewall apa pun; kalau ufw terpasang & aktif, port yang
 # dibutuhkan dibuka otomatis supaya tidak "sudah terpasang tapi ditolak".
 configure_firewall() {
     log_step "Firewall"
-    local ports=("22" "80" "443" "${XRAY_VMESS_WS_PORT}" "${XRAY_VLESS_WS_PORT}" "${XRAY_TROJAN_WS_PORT}")
+    local ports=("22" "${WS_PORT:-80}" "${WSS_PORT:-443}" "${XRAY_VMESS_WS_PORT}" "${XRAY_VLESS_WS_PORT}" "${XRAY_TROJAN_WS_PORT}")
     if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "^Status: active"; then
         local p
         for p in "${ports[@]}"; do
@@ -279,8 +242,12 @@ configure_firewall() {
 
 install_xray() {
     log_step "Install Xray-core (installer resmi XTLS/Xray-install)"
-    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-    systemctl enable xray
+    if ! bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install; then
+        print_error "Instalasi Xray-core gagal (unduhan/installer XTLS bermasalah)"
+        return 1
+    fi
+    systemctl enable xray >/dev/null 2>&1 || true
+    return 0
 }
 
 issue_ssl() {
@@ -292,9 +259,24 @@ issue_ssl() {
         print_warning "Domain belum diset - SSL dilewati (wss & Trojan TLS tidak aktif)"
         return 1
     fi
-    apt-get install -y certbot >/dev/null 2>&1
-    if certbot certonly --standalone --non-interactive --agree-tos \
-        --register-unsafely-without-email -d "$domain"; then
+    apt-get install -y certbot >/dev/null 2>&1 || true
+
+    # certbot --standalone memerlukan port 80. Saat SSL ditambahkan BELAKANGAN
+    # (menu 5 -> 8) bridge sshws sudah memegang port itu, sehingga challenge
+    # selalu gagal. Bridge dihentikan sementara dan WAJIB dinyalakan lagi
+    # apa pun hasil certbot-nya.
+    local ws_stopped=0 cert_ok=1
+    if systemctl is-active --quiet sshws 2>/dev/null; then
+        systemctl stop sshws 2>/dev/null || true
+        ws_stopped=1
+    fi
+    certbot certonly --standalone --non-interactive --agree-tos \
+        --register-unsafely-without-email -d "$domain" && cert_ok=0
+    if (( ws_stopped )); then
+        systemctl start sshws 2>/dev/null || true
+    fi
+
+    if (( cert_ok == 0 )); then
         mkdir -p "$INSTALL_DIR/cert"
         cp "/etc/letsencrypt/live/$domain/fullchain.pem" "$INSTALL_DIR/cert/"
         cp "/etc/letsencrypt/live/$domain/privkey.pem"  "$INSTALL_DIR/cert/"
@@ -306,7 +288,7 @@ issue_ssl() {
 #!/bin/bash
 cp "/etc/letsencrypt/live/$domain/fullchain.pem" "$INSTALL_DIR/cert/"
 cp "/etc/letsencrypt/live/$domain/privkey.pem"  "$INSTALL_DIR/cert/"
-systemctl restart sshws-tls xray 2>/dev/null
+systemctl restart sshws-tls xray 2>/dev/null || true
 EOF
         chmod +x /etc/letsencrypt/renewal-hooks/deploy/sshwsxray.sh
         return 0
@@ -330,7 +312,7 @@ install_cron() {
 * * * * * root ${BIN_DIR}/sshwsxray-cron
 EOF
     chmod 644 /etc/cron.d/sshwsxray
-    systemctl restart cron 2>/dev/null || systemctl restart crond 2>/dev/null
+    systemctl restart cron 2>/dev/null || systemctl restart crond 2>/dev/null || true
 }
 
 # Salin aplikasi ke APP_DIR supaya runtime tidak bergantung pada direktori
@@ -367,6 +349,9 @@ source "${APP_DIR}/lib/telegram.sh"
 source "${APP_DIR}/lib/ssh.sh"
 source "${APP_DIR}/lib/xray.sh"
 source "${APP_DIR}/lib/monitor.sh"
+# snapshot traffic Xray lebih dulu supaya pemakaian terakhir tidak hilang
+# (stats direset setiap kali dibaca), baru penegakan expire/limit IP.
+xray_traffic_update
 monitor_enforce
 CRONEOF
     chmod 755 "${BIN_DIR}/sshwsxray-cron"
@@ -388,6 +373,8 @@ install_all() {
 
     # shellcheck source=lib/common.sh
     source "${SCRIPT_DIR}/lib/common.sh"
+    # shellcheck source=lib/bridge.sh
+    source "${SCRIPT_DIR}/lib/bridge.sh"
     load_config
     apply_config_defaults
 
@@ -399,7 +386,7 @@ install_all() {
     print_info "Arsitektur   : $(uname -m) ($(detect_arch))"
 
     # Tanya domain lebih awal (dipakai untuk cert & link)
-    read -rp "Domain untuk SSL (kosongkan jika tanpa domain): " DOMAIN_INPUT
+    ask "Domain untuk SSL (kosongkan jika tanpa domain): " DOMAIN_INPUT
     DOMAIN_INPUT="${DOMAIN_INPUT:-}"
     if [[ -n "$DOMAIN_INPUT" ]]; then
         if ! [[ "$DOMAIN_INPUT" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
@@ -417,9 +404,9 @@ install_all() {
     fi
     apply_config_defaults
     local key
-    for key in WS_PATH WS_PORT WSS_PORT WS_MAX_PER_IP XRAY_VMESS_WS_PORT \
+    for key in WS_PORT WSS_PORT WS_MAX_PER_IP XRAY_VMESS_WS_PORT \
                XRAY_VLESS_WS_PORT XRAY_TROJAN_WS_PORT XRAY_API_PORT \
-               IP_LIMIT TRIAL_HOURS; do
+               XRAY_TROJAN_MUX_PORT IP_LIMIT TRIAL_HOURS; do
         save_config "$key" "${!key}"
     done
 
@@ -433,8 +420,10 @@ install_all() {
 
     configure_ssh || print_warning "Konfigurasi sshd dilewati - config lama tetap dipakai"
     issue_ssl || true   # SSL dulu: unit sshws-tls butuh cert
-    install_sshws
     install_xray
+    # bridge dipasang setelah SSL & Xray: route Xray dan unit TLS bergantung
+    # pada cert dan pada path acak yang dihasilkan saat render config
+    bridge_write_units
 
     # salin cert dari letsencrypt kalau belum ada di direktori data
     if [[ -n "$DOMAIN_INPUT" && -d "$INSTALL_DIR/cert" ]]; then
@@ -452,17 +441,19 @@ install_all() {
     # shellcheck source=lib/xray.sh
     source "${SCRIPT_DIR}/lib/xray.sh"
     if xray_render_config && xray_validate; then
-        systemctl restart xray
+        systemctl restart xray 2>/dev/null || print_warning "xray gagal di-restart - cek 'journalctl -u xray'"
     else
         print_error "Config Xray tidak valid - service xray tidak di-restart"
     fi
-    systemctl restart sshws 2>/dev/null
-    systemctl restart sshws-tls 2>/dev/null || true
+    # Unit bridge sudah ditulis & di-restart oleh bridge_write_units di atas.
+    # TIDAK ada systemctl tanpa '|| true' mulai dari sini sampai akhir:
+    # service yang gagal start (mis. port 80 dipakai web server lain) tidak
+    # boleh menggagalkan pemasangan menu, cron, dan symlink.
 
-    configure_firewall
+    configure_firewall || true
 
     install_app_files
-    install_cron
+    install_cron || true
     write_cron_script
     install_symlink
 
@@ -474,19 +465,25 @@ install_all() {
     echo -e "${GREEN}==============================================${NC}"
     load_config
     apply_config_defaults
-    local local_domain
+    local local_domain local_ip host
     local_domain=$(get_domain)
+    local_ip=$(pubip)
+    host="${local_domain:-$local_ip}"
     echo -e " Domain    : ${local_domain:-(tanpa domain)}"
-    echo -e " IP        : $(pubip)"
+    echo -e " IP        : ${local_ip}"
     echo -e ""
     echo -e " SSH       : port 22"
-    echo -e " SSH WS    : ws://$(get_domain):${WS_PORT}/ (path standar /)"
+    echo -e " SSH WS    : ws://${host}:${WS_PORT}/ (path standar /)"
     if [[ -f "$INSTALL_DIR/cert/fullchain.pem" ]]; then
-        echo -e " SSH WSS   : wss://$(get_domain):${WSS_PORT}/ (path standar /)"
+        echo -e " SSH WSS   : wss://${host}:${WSS_PORT}/ (path standar /)"
     fi
-    echo -e " VMess WS  : port ${XRAY_VMESS_WS_PORT} (path /${WS_PATH})"
-    echo -e " VLESS WS  : port ${XRAY_VLESS_WS_PORT} (path /${WS_PATH})"
-    echo -e " Trojan WS : port ${XRAY_TROJAN_WS_PORT} (path /${WS_PATH}, TLS)"
+    echo -e ""
+    echo -e " SSH-WebSocket dan Xray memakai PORT YANG SAMA, dibedakan path:"
+    echo -e "   port ${WS_PORT} (ws) dan ${WSS_PORT} (wss, butuh SSL)"
+    echo -e "   VMess  : path /${XRAY_VMESS_WS_PATH}"
+    echo -e "   VLESS  : path /${XRAY_VLESS_WS_PATH}"
+    echo -e "   Trojan : path /${XRAY_TROJAN_WS_PATH}"
+    echo -e " Port langsung Xray (opsional): ${XRAY_VMESS_WS_PORT}/${XRAY_VLESS_WS_PORT} ws, ${XRAY_TROJAN_WS_PORT} tls"
     echo -e ""
     echo -e " Jalankan menu : ${BOLD}sshwsxray${NC}"
     echo -e "${GREEN}==============================================${NC}"
@@ -499,6 +496,8 @@ install_all() {
 ssl_only() {
     # shellcheck source=lib/common.sh
     source "${SCRIPT_DIR}/lib/common.sh"
+    # shellcheck source=lib/bridge.sh
+    source "${SCRIPT_DIR}/lib/bridge.sh"
     init_data
     load_config
     apply_config_defaults
@@ -509,13 +508,18 @@ ssl_only() {
         print_error "SSL gagal - tidak ada perubahan yang diterapkan"
         return 1
     fi
-    install_sshws
+    # port 443 baru mulai dipakai sekarang: pastikan tidak ditolak firewall
+    # (kalau ufw aktif) - sama seperti saat instalasi penuh
+    configure_firewall || true
     install_app_files
     # shellcheck source=lib/xray.sh
     source "${SCRIPT_DIR}/lib/xray.sh"
     if xray_render_config; then
         xray_safe_restart
     fi
+    # unit bridge ditulis ulang: sekarang ada cert, jadi jalur TLS (80->443)
+    # dan route Trojan di 443 ikut terpasang
+    bridge_write_units
     print_success "SSL terpasang: wss://${WSS_PORT} (SSH) dan inbound Trojan WS aktif"
     return 0
 }
