@@ -128,7 +128,7 @@ Yang ditangani bagian bootstrap:
 
 Yang ditangani bagian instalasi:
 1. Deteksi OS/arch (amd64/arm64)
-2. Install dependencies (curl, jq, python3, openssl, cron, openssh-server, speedtest-cli)
+2. Install dependencies (curl, wget, tar, python3, openssl, cron, openssh-server, iproute2, procps, speedtest-cli)
 3. Tanya domain untuk SSL (opsional, harus sudah A-record ke IP VPS)
 4. Konfigurasi sshd (port 22), pasang bridge WebSocket (`sshws`/`sshws-tls`), Xray-core, certbot
 5. Render config Xray, pasang cron, salin aplikasi ke `/usr/local/lib/sshwsxray`, buat symlink `menu` dan `sshwsxray`
