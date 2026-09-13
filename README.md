@@ -77,23 +77,51 @@ Test:
 
 ```bash
 python3 tests/test_sshws.py     # 21 test: handshake '/', path bebas, mode ketat, echo mentah, pipelined, 1MB payload, TLS, konkurensi
+bash tests/test_install.sh      # bootstrap installer (stub curl, tanpa jaringan)
+bash tests/test_installer.sh    # fungsi installer di sandbox
 ```
 
 ## Instalasi
 
+Satu perintah — tanpa mengunduh arsip, tanpa ekstrak, tanpa langkah manual:
+
 ```bash
-sudo bash setup.sh
+curl -fsSL https://raw.githubusercontent.com/superbad1/sshwsxray/main/install.sh | sudo bash
 ```
 
-Installer akan:
+`install.sh` adalah **satu berkas yang melakukan semuanya** (dulu terpisah
+menjadi `install.sh` + `setup.sh`). Berkas ini punya dua mode, ditentukan dari
+cara ia dipanggil:
+
+| Cara dipanggil | Mode | Yang dilakukan |
+|---|---|---|
+| dibaca dari pipe (`curl … \| sudo bash`) | bootstrap | unduh berkas aplikasi satu per satu (raw) ke direktori sementara, lalu jalankan salinan hasil unduhan |
+| sebagai berkas dengan `lib/` di sebelahnya | in-place | langsung menjalankan instalasi |
+
+Mode in-place itulah yang berjalan saat bootstrap dan saat menu Pengaturan → 8
+memanggil `SSL_ONLY=1 /usr/local/lib/sshwsxray/install.sh`. Tidak ada git,
+tidak ada arsip, tidak ada ekstrak, tidak ada argumen — semua pengaturan
+ditanyakan saat instalasi atau diubah kapan saja lewat menu `sudo sshwsxray`.
+
+Yang ditangani bagian bootstrap:
+- menolak jalan bila bukan root, dan berhenti lebih awal bila OS bukan Debian/Ubuntu
+- memasang `curl` sendiri bila belum ada
+- berhenti dengan nama berkas yang gagal diunduh (tanpa melanjutkan ke instalasi)
+- menghubungkan ulang stdin ke `/dev/tty`, sehingga pertanyaan domain tetap bisa dijawab walau script dibaca dari pipe
+
+Yang ditangani bagian instalasi:
 1. Deteksi OS/arch (amd64/arm64)
 2. Install dependencies (curl, jq, python3, openssl, cron, openssh-server, speedtest-cli)
 3. Tanya domain untuk SSL (opsional, harus sudah A-record ke IP VPS)
 4. Konfigurasi sshd (port 22), pasang bridge WebSocket (`sshws`/`sshws-tls`), Xray-core, certbot
-5. Render config Xray, pasang cron, buat symlink `sshwsxray`
+5. Render config Xray, pasang cron, salin aplikasi ke `/usr/local/lib/sshwsxray`, buat symlink `sshwsxray`
+
+Daftar berkas yang diunduh dipatok di dalam `install.sh`; `tests/test_install.sh`
+membandingkannya dengan isi repo, jadi berkas baru di `lib/` yang lupa
+didaftarkan akan langsung ketahuan.
 
 ### Tanpa domain
-Jalankan tanpa mengisi domain. wss/443 dan Trojan TLS tidak aktif; VMess WS dan VLESS WS tetap jalan. SSL bisa ditambahkan kapan saja dari **menu 5 → 8** (`setup.sh --ssl-only`).
+Jalankan tanpa mengisi domain. wss/443 dan Trojan TLS tidak aktif; VMess WS dan VLESS WS tetap jalan. SSL bisa ditambahkan kapan saja dari **menu 5 → 8** (perintah dijalankannya `SSL_ONLY=1 install.sh`).
 
 ## Penggunaan
 
@@ -143,6 +171,8 @@ bersamaan dari satu alamat IP; isi `0` untuk mematikannya.
 | `/etc/sshwsxray/xray_users.db` | Database akun Xray |
 | `/etc/sshwsxray/xray_traffic.db` | Snapshot traffic per akun |
 | `/usr/local/etc/xray/config.json` | Config Xray (dirender otomatis) |
+| `/usr/local/lib/sshwsxray/install.sh` | Installer (dipakai menu 5 → 8 untuk SSL) |
+| `/usr/local/lib/sshwsxray/menu.sh` | Menu utama (`sshwsxray`) |
 | `/usr/local/lib/sshwsxray/sshws.py` | Bridge WebSocket kustom (pengganti gost) |
 | `/etc/systemd/system/sshws*.service` | Unit systemd bridge WebSocket |
 | `/root/backup/` | Arsip backup |

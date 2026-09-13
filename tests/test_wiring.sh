@@ -70,7 +70,7 @@ done < <(grep -oE '^\s+[0-9x|Xa-zA-Z]+\)\s+[a-z_][a-zA-Z0-9_]*\s+;;' "$PROJECT_R
 check "semua handler menu terdefinisi" "$missing" "0"
 
 # cron script harus meng-source semua lib yang dipakainya
-CRON_BODY=$(sed -n '/^write_cron_script()/,/^}/p' "$PROJECT_ROOT/setup.sh")
+CRON_BODY=$(sed -n '/^write_cron_script()/,/^}/p' "$PROJECT_ROOT/install.sh")
 for lib in common telegram ssh xray monitor; do
     if echo "$CRON_BODY" | grep -q "lib/${lib}.sh"; then
         echo "PASS  cron meng-source lib/${lib}.sh"

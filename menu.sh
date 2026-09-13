@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
 #  menu.sh - SSH Websocket + Xray Manager main menu
-#  Usage: sshwsxray  (symlink installed by setup.sh)
+#  Usage: sshwsxray  (symlink installed by install.sh)
 # ============================================================
 
 # Resolve symlinks so `sshwsxray` works from /usr/local/bin
@@ -206,7 +206,12 @@ menu_settings() {
                 fi
                 pause_menu ;;
             8)
-                "$SCRIPT_DIR/setup.sh" --ssl-only
+                # install.sh juga yang memasang sertifikat (mode SSL saja)
+                if [[ -f "$SCRIPT_DIR/install.sh" ]]; then
+                    SSL_ONLY=1 "$SCRIPT_DIR/install.sh"
+                else
+                    print_error "install.sh tidak ada di $SCRIPT_DIR - jalankan ulang installer"
+                fi
                 pause_menu ;;
             x|X) return 0 ;;
             *) print_warning "Pilihan tidak valid"; sleep 1 ;;
